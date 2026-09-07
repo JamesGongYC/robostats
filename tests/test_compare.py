@@ -27,12 +27,12 @@ from robostats.records import SCHEMA_VERSION, EpisodeRecord, PairedResult, Proto
 
 #: 2x2 tables as (n_both_success, n_ab, n_ba, n_both_failure). The grid covers
 #: small discordant counts, m = 0, equal discordant cells, wholly one-sided
-#: tables, and one table large enough for the asymptotics to be reasonable.
-TABLES: list[tuple[int, int, int, int]] = [
+#: tables, the two corners where every pair is discordant in one direction, and
+#: one table large enough for the asymptotics to be reasonable.
+BASE_TABLES: list[tuple[int, int, int, int]] = [
     (10, 0, 0, 5),
     (0, 0, 0, 3),
     (10, 1, 0, 5),
-    (10, 0, 1, 5),
     (10, 1, 1, 5),
     (10, 2, 1, 7),
     (10, 3, 0, 7),
@@ -40,11 +40,37 @@ TABLES: list[tuple[int, int, int, int]] = [
     (12, 4, 4, 30),
     (0, 7, 1, 0),
     (0, 1, 0, 0),
+    (0, 10, 0, 0),
     (30, 8, 2, 10),
     (200, 15, 4, 81),
     (100, 25, 25, 100),
     (1, 0, 9, 40),
 ]
+
+
+def mirror(counts: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Exchange the two policies: the discordant cells swap, the rest is fixed."""
+    n_both_success, n_ab, n_ba, n_both_failure = counts
+    return (n_both_success, n_ba, n_ab, n_both_failure)
+
+
+def closed_under_mirror(
+    tables: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    """Return ``tables`` with every mirror image present, in a stable order."""
+    result: list[tuple[int, int, int, int]] = []
+    for counts in tables:
+        for candidate in (counts, mirror(counts)):
+            if candidate not in result:
+                result.append(candidate)
+    return result
+
+
+#: The grid the tests sweep. Derived rather than listed, so a table cannot be
+#: added without its mirror: delta is antisymmetric in the two policies, and a
+#: grid that covers one orientation but not the other hides defects that only
+#: appear on one side. The corner (0, 0, 10, 0) was exactly such a defect.
+TABLES: list[tuple[int, int, int, int]] = closed_under_mirror(BASE_TABLES)
 
 #: The subset of the grid on which a discordant-count-conditioned test is defined.
 DISCORDANT_TABLES = [counts for counts in TABLES if counts[1] + counts[2] > 0]
@@ -463,14 +489,46 @@ def test_point_estimate_agrees_with_mcnemar(counts: tuple[int, int, int, int]) -
 def test_swapping_the_policies_reflects_the_interval(
     counts: tuple[int, int, int, int]
 ) -> None:
-    # delta is antisymmetric in the two policies, so exchanging them must
-    # negate and reflect the interval rather than change its width.
-    n_both_success, n_ab, n_ba, n_both_failure = counts
-    forward = paired_difference(table(n_both_success, n_ab, n_ba, n_both_failure))
-    reversed_ = paired_difference(table(n_both_success, n_ba, n_ab, n_both_failure))
-    assert reversed_.point == pytest.approx(-forward.point)
-    assert reversed_.lower == pytest.approx(-forward.upper)
-    assert reversed_.upper == pytest.approx(-forward.lower)
+    # delta is antisymmetric in the two policies, so exchanging them must negate
+    # and reflect the interval rather than change its width.
+    #
+    # The point estimate and the boundary endpoints are asserted exactly. Both
+    # are reached by a sign flip or by returning the boundary itself, and both
+    # are exact in floating point; an approximate assertion here is what let a
+    # lower bound of -1 + 1e-12 pass against a mirrored upper bound of exactly 1.
+    #
+    # Root-found endpoints are asserted at abs=1e-14. They cannot be bit-equal:
+    # the constrained MLE is evaluated through a different expression on each
+    # side, and each endpoint is a separate brentq solve, so the two agree to
+    # within rounding rather than exactly. Measured maximum over this grid and
+    # all three confidence levels is 1.79e-15, at (1, 0, 9, 40) at 95%.
+    forward = paired_difference(table(*counts))
+    reversed_ = paired_difference(table(*mirror(counts)))
+
+    assert reversed_.point == -forward.point
+
+    for reflected, original in ((reversed_.lower, forward.upper), (reversed_.upper, forward.lower)):
+        if abs(original) == 1.0:
+            assert reflected == -original
+        else:
+            assert reflected == pytest.approx(-original, abs=1e-14)
+
+
+@pytest.mark.parametrize("counts", [(0, 10, 0, 0), (0, 0, 10, 0), (0, 1, 0, 0), (0, 0, 1, 0)])
+def test_the_interval_contains_its_point_estimate_at_the_corners(
+    counts: tuple[int, int, int, int]
+) -> None:
+    # Every pair discordant in one direction, so delta_hat is exactly +/-1 and
+    # the interval must reach the boundary to contain it. Exact comparison: the
+    # defect this guards against was a lower bound of -1 + 1e-12, which any
+    # tolerance would have absorbed.
+    interval = paired_difference(table(*counts))
+    assert abs(interval.point) == 1.0
+    assert interval.lower <= interval.point <= interval.upper
+    if interval.point == 1.0:
+        assert interval.upper == 1.0
+    else:
+        assert interval.lower == -1.0
 
 
 def test_zero_discordant_pairs_gives_a_valid_symmetric_interval() -> None:

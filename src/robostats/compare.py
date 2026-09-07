@@ -277,8 +277,12 @@ def paired_difference(paired: PairedResult, *, confidence: float = 0.95) -> Conf
     def score(delta: float) -> float:
         return _tango_score(paired, delta)
 
-    lower = _solve_endpoint(score, target=z, bracket=(-1.0 + _BOUNDARY_MARGIN, delta_hat))
-    upper = _solve_endpoint(score, target=-z, bracket=(delta_hat, 1.0 - _BOUNDARY_MARGIN))
+    lower = _solve_endpoint(
+        score, target=z, bracket=(-1.0 + _BOUNDARY_MARGIN, delta_hat), boundary=-1.0
+    )
+    upper = _solve_endpoint(
+        score, target=-z, bracket=(delta_hat, 1.0 - _BOUNDARY_MARGIN), boundary=1.0
+    )
     return ConfidenceInterval(
         point=delta_hat,
         lower=lower,
@@ -296,19 +300,31 @@ _BOUNDARY_MARGIN = 1e-12
 
 
 def _solve_endpoint(
-    score: Callable[[float], float], *, target: float, bracket: tuple[float, float]
+    score: Callable[[float], float],
+    *,
+    target: float,
+    bracket: tuple[float, float],
+    boundary: float,
 ) -> float:
-    """Return the ``delta`` at which ``score`` equals ``target``, or the bracket end.
+    """Return the ``delta`` at which ``score`` equals ``target``, or ``boundary``.
 
     ``score`` is decreasing, so the two bracket ends straddle the target unless
-    the interval runs into the boundary of the feasible range, in which case
-    there is no root and the boundary is the endpoint.
+    this side of the interval runs into the boundary of the feasible range, in
+    which case there is no root and the endpoint is the boundary itself.
+
+    ``boundary`` is that limit, ``-1.0`` for the lower endpoint and ``1.0`` for
+    the upper. It is passed in rather than read off the bracket: the bracket
+    stops :data:`_BOUNDARY_MARGIN` short of the true limit, because the score's
+    variance vanishes exactly there, and returning that shortened end would put
+    the endpoint 1e-12 inside the boundary on one side while the other side
+    returned the boundary exactly. The two sides must be exact mirrors, since
+    exchanging the two policies negates ``delta``.
     """
     left, right = bracket
     if left >= right:
-        # delta_hat sits on the boundary, so this side of the interval has no
-        # interior to search.
-        return float(min(max(left, -1.0), 1.0))
+        # delta_hat sits on the boundary of the feasible range, so this side of
+        # the interval has no interior to search.
+        return boundary
     shifted_left = score(left) - target
     shifted_right = score(right) - target
     if shifted_left == 0.0:
@@ -317,8 +333,8 @@ def _solve_endpoint(
         return float(right)
     if (shifted_left > 0.0) == (shifted_right > 0.0):
         # No sign change: the score never reaches +/- z inside the feasible
-        # range, so the interval extends to the boundary it was searching from.
-        return float(left if abs(left) > abs(right) else right)
+        # range, so the interval extends to the boundary.
+        return boundary
     return float(brentq(lambda delta: score(delta) - target, left, right, xtol=1e-14, rtol=1e-15))
 
 
