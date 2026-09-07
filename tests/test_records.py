@@ -17,7 +17,7 @@ from robostats.errors import (
     RobostatsError,
     SchemaError,
 )
-from robostats.records import EpisodeRecord, Protocol, RecordSet, pair
+from robostats.records import EpisodeRecord, PairedResult, Protocol, RecordSet, pair
 
 
 def record(
@@ -505,3 +505,38 @@ def test_pair_raises_when_no_scenario_matches() -> None:
     message = str(excinfo.value)
     assert "a holds 2" in message
     assert "b holds 1" in message
+
+
+def test_paired_result_rejects_a_table_with_no_pairs() -> None:
+    # n_pairs == 0 is unrepresentable rather than re-checked by every consumer:
+    # each statistic defined on a paired table divides by n_pairs.
+    with pytest.raises(EmptyRecordSetError, match="all four"):
+        PairedResult(
+            n_both_success=0,
+            n_a_success_b_failure=0,
+            n_b_success_a_failure=0,
+            n_both_failure=0,
+            scenario_ids=(),
+            dropped_from_a=0,
+            dropped_from_b=0,
+            protocol_fingerprints_a=(),
+            protocol_fingerprints_b=(),
+            replicates="strict",
+        )
+
+
+def test_paired_result_accepts_a_table_with_one_pair() -> None:
+    single = PairedResult(
+        n_both_success=1,
+        n_a_success_b_failure=0,
+        n_b_success_a_failure=0,
+        n_both_failure=0,
+        scenario_ids=("scenario_0",),
+        dropped_from_a=0,
+        dropped_from_b=0,
+        protocol_fingerprints_a=("fingerprint",),
+        protocol_fingerprints_b=("fingerprint",),
+        replicates="strict",
+    )
+    assert single.n_pairs == 1
+    assert single.n_discordant == 0

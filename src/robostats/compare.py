@@ -13,16 +13,20 @@ touch episodes directly.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from scipy import stats
+from scipy.optimize import brentq
 
-from robostats.errors import EmptyRecordSetError
+from robostats.intervals import ConfidenceInterval
 from robostats.records import PairedResult
 
 __all__ = [
     "McNemarResult",
     "mcnemar",
+    "paired_difference",
 ]
 
 #: The two accepted values of ``method``. There is no automatic selection between
@@ -122,9 +126,6 @@ def mcnemar(
     ------
     ValueError
         If ``method`` is not ``"exact"`` or ``"chi2"``.
-    EmptyRecordSetError
-        If the table holds no pairs. A difference in success rate over no shared
-        scenarios is undefined, not zero.
 
     Notes
     -----
@@ -142,13 +143,9 @@ def mcnemar(
             f"method must be one of {', '.join(repr(name) for name in METHODS)}; "
             f"got {method!r}. There is no automatic selection between them."
         )
+    # n_pairs is guaranteed positive: PairedResult rejects an all-zero table at
+    # construction, so the denominator of delta cannot be zero here.
     n_pairs = paired.n_pairs
-    if n_pairs == 0:
-        raise EmptyRecordSetError(
-            "mcnemar() is undefined on a table with no matched scenarios; all four "
-            "cells of the 2x2 table are zero"
-        )
-
     n_ab = paired.n_a_success_b_failure
     n_ba = paired.n_b_success_a_failure
     m = n_ab + n_ba
@@ -208,3 +205,214 @@ def _chi_square_p_value(n_ab: int, n_ba: int, *, continuity: bool) -> tuple[floa
     correction = 1.0 if continuity else 0.0
     statistic = (abs(n_ab - n_ba) - correction) ** 2 / (n_ab + n_ba)
     return float(statistic), float(stats.chi2.sf(statistic, 1))
+
+
+def paired_difference(paired: PairedResult, *, confidence: float = 0.95) -> ConfidenceInterval:
+    """Score confidence interval for the paired difference in success rates.
+
+    The estimand is ``delta = p_A - p_B``, the difference in true success rates
+    between two policies evaluated on the same scenarios. The point estimate is
+    ``(n_ab - n_ba) / n_pairs``, in which the concordant cells cancel, and the
+    interval is Tango's (1998) score interval for that estimand.
+
+    A Wald interval on the paired difference is not used. Its coverage is poor
+    at exactly the small discordant counts this package encounters, and its
+    bounds can fall outside ``[-1, 1]``.
+
+    Parameters
+    ----------
+    paired : PairedResult
+        The 2x2 table from :func:`~robostats.records.pair`.
+    confidence : float, default 0.95
+        Nominal two-sided confidence level, strictly inside ``(0, 1)``.
+
+    Returns
+    -------
+    ConfidenceInterval
+        ``point`` is the estimate of ``delta``, ``lower`` and ``upper`` bound it,
+        and ``method`` is ``"tango"``. Note that ``ConfidenceInterval`` is reused
+        from :mod:`robostats.intervals`, where its docstring describes bounds on
+        a proportion in ``[0, 1]``; here the bounds lie in ``[-1, 1]``.
+
+    Raises
+    ------
+    ValueError
+        If ``confidence`` lies outside ``(0, 1)``.
+
+    Notes
+    -----
+    The interval is the set of ``delta`` the score test does not reject, that is
+    ``{delta : |Z(delta)| <= z}``, so its endpoints are the roots of
+    ``Z(delta) = z`` and ``Z(delta) = -z``. They are found with
+    :func:`scipy.optimize.brentq` rather than from a closed form. ``Z`` is
+    decreasing in ``delta``, so the lower endpoint solves ``Z = +z`` and the
+    upper endpoint solves ``Z = -z``. Where no root exists inside the feasible
+    range, the endpoint is the boundary itself, ``-1`` or ``1``.
+
+    Zero discordant pairs is not a special case here. The score statistic and
+    the constrained MLE are both defined at ``m == 0``, and the interval they
+    give is centred on ``delta = 0`` and non-degenerate.
+
+    See Also
+    --------
+    _tango_score : the statistic being inverted, and its derivation.
+
+    References
+    ----------
+    Tango, T. (1998). Equivalence test and confidence interval for the
+    difference in proportions for the paired-sample design. *Statistics in
+    Medicine*, 17(8), 891-908.
+    """
+    if not 0.0 < confidence < 1.0:
+        raise ValueError(f"confidence must lie strictly inside (0, 1), got {confidence!r}")
+
+    n_pairs = paired.n_pairs
+    n_ab = paired.n_a_success_b_failure
+    n_ba = paired.n_b_success_a_failure
+    delta_hat = (n_ab - n_ba) / n_pairs
+    z = stats.norm.ppf(0.5 + confidence / 2.0)
+
+    def score(delta: float) -> float:
+        return _tango_score(paired, delta)
+
+    lower = _solve_endpoint(score, target=z, bracket=(-1.0 + _BOUNDARY_MARGIN, delta_hat))
+    upper = _solve_endpoint(score, target=-z, bracket=(delta_hat, 1.0 - _BOUNDARY_MARGIN))
+    return ConfidenceInterval(
+        point=delta_hat,
+        lower=lower,
+        upper=upper,
+        confidence=confidence,
+        method="tango",
+    )
+
+
+#: How far inside [-1, 1] the root search brackets. The score statistic's
+#: variance vanishes at the two boundaries, so they are approached but not
+#: evaluated; an endpoint whose true root lies within this margin of a boundary
+#: is reported as the boundary itself.
+_BOUNDARY_MARGIN = 1e-12
+
+
+def _solve_endpoint(
+    score: Callable[[float], float], *, target: float, bracket: tuple[float, float]
+) -> float:
+    """Return the ``delta`` at which ``score`` equals ``target``, or the bracket end.
+
+    ``score`` is decreasing, so the two bracket ends straddle the target unless
+    the interval runs into the boundary of the feasible range, in which case
+    there is no root and the boundary is the endpoint.
+    """
+    left, right = bracket
+    if left >= right:
+        # delta_hat sits on the boundary, so this side of the interval has no
+        # interior to search.
+        return float(min(max(left, -1.0), 1.0))
+    shifted_left = score(left) - target
+    shifted_right = score(right) - target
+    if shifted_left == 0.0:
+        return float(left)
+    if shifted_right == 0.0:
+        return float(right)
+    if (shifted_left > 0.0) == (shifted_right > 0.0):
+        # No sign change: the score never reaches +/- z inside the feasible
+        # range, so the interval extends to the boundary it was searching from.
+        return float(left if abs(left) > abs(right) else right)
+    return float(brentq(lambda delta: score(delta) - target, left, right, xtol=1e-14, rtol=1e-15))
+
+
+def _tango_score(paired: PairedResult, delta: float) -> float:
+    """Tango's score statistic for the null ``p_A - p_B == delta``.
+
+    Derived from the multinomial likelihood rather than transcribed. Write the
+    four cell probabilities as ``p11, p12, p21, p22``. The estimator of ``delta``
+    is ``(n_ab - n_ba) / n``, whose numerator has expectation ``n * delta`` and,
+    under the constraint ``p12 = p21 + delta``, variance
+
+        Var(n_ab - n_ba) = n * (p12 + p21 - (p12 - p21)**2)
+                         = n * (2 * p21 + delta * (1 - delta)).
+
+    Evaluating that variance at the MLE of ``p21`` constrained to the null, as a
+    score test requires rather than at the unconstrained estimate, gives
+
+        Z(delta) = (n_ab - n_ba - n * delta)
+                   / sqrt(n * (2 * p21_tilde + delta * (1 - delta))).
+
+    Parameters
+    ----------
+    paired : PairedResult
+        The 2x2 table.
+    delta : float
+        The null value of ``p_A - p_B``, strictly inside ``(-1, 1)``.
+
+    Returns
+    -------
+    float
+        The score statistic, positive when the data favour a larger ``delta``
+        than the null asserts.
+    """
+    n_pairs = paired.n_pairs
+    n_ab = paired.n_a_success_b_failure
+    n_ba = paired.n_b_success_a_failure
+    p21 = _constrained_mle_p21(paired, delta)
+    numerator = n_ab - n_ba - n_pairs * delta
+    variance = n_pairs * (2.0 * p21 + delta * (1.0 - delta))
+    if variance <= 0.0:
+        # A zero variance is reached only where the constrained model admits no
+        # discordance at all: at the boundary of the feasible range, and at
+        # delta = 0 when the two policies agreed on every scenario. In the
+        # latter case the numerator is zero too, and the statistic is 0/0; it is
+        # taken to be 0, the value that says the data are exactly what the null
+        # predicts, since a table with no discordant pairs is the strongest
+        # possible agreement with delta = 0. Otherwise the observed difference is
+        # impossible under the constraint and the statistic diverges.
+        if numerator == 0.0:
+            return 0.0
+        return math.inf if numerator > 0.0 else -math.inf
+    return numerator / math.sqrt(variance)
+
+
+def _constrained_mle_p21(paired: PairedResult, delta: float) -> float:
+    """MLE of ``p21`` under the constraint ``p12 - p21 == delta``.
+
+    Derivation. The concordant cells enter the likelihood only through their
+    combined probability ``1 - delta - 2 * p21``, since the split between them is
+    unconstrained, so with ``c = n_both_success + n_both_failure`` the profile
+    log-likelihood in ``s = p21`` is
+
+        L(s) = c * log(1 - delta - 2s) + n_ab * log(s + delta) + n_ba * log(s).
+
+    Setting ``dL/ds = 0`` and clearing the denominators ``s``, ``s + delta`` and
+    ``1 - delta - 2s`` gives a quadratic in ``s``:
+
+        2n s**2 + [delta * (n + c + 2 * n_ba) - (n_ab + n_ba)] s
+                - n_ba * delta * (1 - delta) = 0,
+
+    whose larger root is the maximum. The smaller root is negative, or below the
+    feasible lower limit ``max(0, -delta)``, in every case reachable here.
+
+    Parameters
+    ----------
+    paired : PairedResult
+        The 2x2 table.
+    delta : float
+        The null value of ``p_A - p_B``.
+
+    Returns
+    -------
+    float
+        The constrained MLE of ``p21``, clipped into its feasible range.
+    """
+    n_pairs = paired.n_pairs
+    n_ab = paired.n_a_success_b_failure
+    n_ba = paired.n_b_success_a_failure
+    concordant = paired.n_both_success + paired.n_both_failure
+
+    quadratic = 2.0 * n_pairs
+    linear = delta * (n_pairs + concordant + 2 * n_ba) - (n_ab + n_ba)
+    constant = -n_ba * delta * (1.0 - delta)
+    discriminant = linear * linear - 4.0 * quadratic * constant
+    root = (-linear + math.sqrt(max(discriminant, 0.0))) / (2.0 * quadratic)
+
+    lowest = max(0.0, -delta)
+    highest = (1.0 - delta) / 2.0
+    return min(max(root, lowest), highest)

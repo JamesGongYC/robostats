@@ -330,6 +330,14 @@ class PairedResult:
         Sorted distinct protocol fingerprints present in ``b``.
     replicates : str
         The replicate policy the join was performed under.
+
+    Raises
+    ------
+    EmptyRecordSetError
+        If all four counts are zero. A paired table over no shared scenarios
+        carries no information, and every statistic defined on one divides by
+        ``n_pairs``, so the state is rejected at construction rather than
+        re-checked by each consumer.
     """
 
     n_both_success: int
@@ -342,6 +350,14 @@ class PairedResult:
     protocol_fingerprints_a: tuple[str, ...]
     protocol_fingerprints_b: tuple[str, ...]
     replicates: str
+
+    def __post_init__(self) -> None:
+        if self.n_pairs == 0:
+            raise EmptyRecordSetError(
+                "a PairedResult requires at least one matched scenario, but all four "
+                "cells of the 2x2 table are zero. A difference in success rate over no "
+                "shared scenarios is undefined, not zero."
+            )
 
     @property
     def n_pairs(self) -> int:
