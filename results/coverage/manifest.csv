@@ -3,7 +3,7 @@
 #   12 decimals, serialized as repr(float) one per line,
 #   newline separated with a trailing newline, encoded UTF-8.
 # Regenerate the full curves with: uv run python validation/coverage.py
-region,method,n,confidence,grid_points,rows_committed,sha256
+region,method,n,confidence,points,rows_committed,sha256
 full-range,wilson,10,0.9,2399,331,45bb09d99c700bc33e7daa3d7b99c8ce7e2993ea567d0941c928c375b74fc237
 full-range,wilson,10,0.95,2399,331,b301ed6a9e74a61afde06c42c893404f51a0cb79cc0ac57f462618752b6e8003
 full-range,wilson,10,0.99,2399,331,dceb4578cf74b421d96cc13078109b31752319eaede835a2d788539a1c22e277
@@ -49,3 +49,9 @@ high-p,clopper_pearson,50,0.99,281,281,78dc6c6ff04153fc963ac08832a3f8dcd354982c4
 high-p,agresti_coull,50,0.9,281,281,1699312158f6e5be838f76d46e3cdc86690cce0107843609c4b648154e057a7c
 high-p,agresti_coull,50,0.95,281,281,44f1c965ab1725a39a93f331be925a37e193a6fec462cf0e05fa10f1fc73c85f
 high-p,agresti_coull,50,0.99,281,281,6e6175a571e7075b38cc0f7db07ec29881e0c37e8a0bba24fa5a17107e7c74d3
+tango,tango,10,0.9,10,10,517e90acb1588f5f49e8c8fa2249ac5cf872b925e2a0b5ab38a2de02270bfb93
+tango,tango,10,0.95,10,10,31b8ecda3db1b4222074a5ccfa1bc691b00bc0a9c33fd08b30baa59be089a143
+tango,tango,10,0.99,10,10,e869088bd3241cc7e3b373889fb068afc42bed37815251a96c318c29610cb061
+tango,tango,20,0.9,10,10,d30f63fef505a28b0908fd0e22d0b7195a2552eb9fc5f9de2288d5bedd52c75c
+tango,tango,20,0.95,10,10,a13f780c459f70f201d44fb46d3396c5a398a87e8fcd8a8af1b4c256afd9d799
+tango,tango,20,0.99,10,10,1c5a9567dee7fe2d9fc8c25707e3c59add7d09aae3dcb0b363d653000c1811b2

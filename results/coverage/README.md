@@ -57,7 +57,7 @@ the method, not a defect.
 
 ## Summary, full range
 
-| method | n | level | min coverage | at p | mean | below nominal |
+| method | n | level | min coverage | at p | mean coverage | below nominal |
 | --- | --- | --- | --- | --- | --- | --- |
 | wilson | 10 | 0.90 | 0.7966 | 0.0224785 | 0.9235 | 971 / 2399 |
 | wilson | 10 | 0.95 | 0.8383 | 0.0174835 | 0.9600 | 920 / 2399 |
@@ -103,17 +103,52 @@ of `linspace(0.85, 0.99, 281)`. This is where
 robot policy success rates typically sit, and it is not the region the
 full-range mean above is dominated by.
 
-| method | n | level | min coverage | at p | mean | below nominal |
+The width columns are `E_p[upper(X) - lower(X)]` under the same enumeration,
+summarized across the region grid. They are here so the cost of a guarantee
+is visible next to the guarantee: a method can buy coverage by being wide,
+and the comparison between methods is not readable from coverage alone.
+These CSVs carry a third column, `expected_width`, per grid point.
+
+| method | n | level | min coverage | at p | mean coverage | below nominal | mean width | min width | max width |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| wilson | 50 | 0.90 | 0.8622 | 0.987 | 0.9105 | 104 / 281 | 0.1226 | 0.0648 | 0.1628 |
+| wilson | 50 | 0.95 | 0.8951 | 0.989 | 0.9549 | 101 / 281 | 0.1488 | 0.0855 | 0.1939 |
+| wilson | 50 | 0.99 | 0.9608 | 0.985 | 0.9877 | 164 / 281 | 0.2019 | 0.1317 | 0.2541 |
+| clopper_pearson | 50 | 0.90 | 0.9119 | 0.903 | 0.9504 | 0 / 281 | 0.1371 | 0.0732 | 0.1806 |
+| clopper_pearson | 50 | 0.95 | 0.9509 | 0.9285 | 0.9773 | 0 / 281 | 0.1602 | 0.0876 | 0.2107 |
+| clopper_pearson | 50 | 0.99 | 0.9912 | 0.8945 | 0.9963 | 0 / 281 | 0.2060 | 0.1190 | 0.2687 |
+| agresti_coull | 50 | 0.90 | 0.8754 | 0.878 | 0.9299 | 23 / 281 | 0.1298 | 0.0752 | 0.1668 |
+| agresti_coull | 50 | 0.95 | 0.9469 | 0.8745 | 0.9684 | 6 / 281 | 0.1593 | 0.0993 | 0.2002 |
+| agresti_coull | 50 | 0.99 | 0.9876 | 0.896 | 0.9931 | 46 / 281 | 0.2197 | 0.1528 | 0.2661 |
+
+## Paired difference: Tango score interval
+
+The same enumeration principle applied to the paired 2x2. At `n` pairs the
+outcome space is every table `(n11, n12, n21, n22)` summing to `n`, of which
+there are `C(n + 3, 3)`, so the coverage
+
+```
+C = P(lower(T) <= delta <= upper(T)),   T ~ Multinomial(n, cells)
+```
+
+with `delta = p12 - p21` is again an exact finite sum, not a simulation.
+`n` stays small because the table count grows quickly, and the sweep is over
+10 true cell configurations rather than a dense grid:
+the paired parameter space is three dimensional, and what governs a paired
+test is how much discordance there is, since the test conditions on it.
+
+Tango's interval is a score interval, not an exact one. Nothing here asserts a
+pointwise lower bound on its coverage; the per-configuration values are in the
+`tango-n<N>-<level>.csv` artifacts.
+
+| n | level | tables | min coverage | at configuration | mean | below nominal |
 | --- | --- | --- | --- | --- | --- | --- |
-| wilson | 50 | 0.90 | 0.8622 | 0.987 | 0.9105 | 104 / 281 |
-| wilson | 50 | 0.95 | 0.8951 | 0.989 | 0.9549 | 101 / 281 |
-| wilson | 50 | 0.99 | 0.9608 | 0.985 | 0.9877 | 164 / 281 |
-| clopper_pearson | 50 | 0.90 | 0.9119 | 0.903 | 0.9504 | 0 / 281 |
-| clopper_pearson | 50 | 0.95 | 0.9509 | 0.9285 | 0.9773 | 0 / 281 |
-| clopper_pearson | 50 | 0.99 | 0.9912 | 0.8945 | 0.9963 | 0 / 281 |
-| agresti_coull | 50 | 0.90 | 0.8754 | 0.878 | 0.9299 | 23 / 281 |
-| agresti_coull | 50 | 0.95 | 0.9469 | 0.8745 | 0.9684 | 6 / 281 |
-| agresti_coull | 50 | 0.99 | 0.9876 | 0.896 | 0.9931 | 46 / 281 |
+| 10 | 0.90 | 286 | 0.8994 | balanced_discordance | 0.9522 | 1 / 10 |
+| 10 | 0.95 | 286 | 0.9449 | no_concordance | 0.9846 | 1 / 10 |
+| 10 | 0.99 | 286 | 0.9937 | no_concordance | 0.9990 | 0 / 10 |
+| 20 | 0.90 | 1771 | 0.8760 | large_edge | 0.9401 | 1 / 10 |
+| 20 | 0.95 | 1771 | 0.9498 | no_concordance | 0.9781 | 1 / 10 |
+| 20 | 0.99 | 1771 | 0.9923 | no_concordance | 0.9979 | 0 / 10 |
 
 ## Per-configuration curves
 

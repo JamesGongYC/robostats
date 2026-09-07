@@ -34,18 +34,20 @@ from pathlib import Path
 
 import numpy as np
 from scipy import stats
+from scipy.special import gammaln
 
 # Importable both as a script and as `validation.coverage`, without installing
 # this directory as a package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from robostats.compare import paired_difference
 from robostats.intervals import (
     ConfidenceInterval,
     agresti_coull,
     clopper_pearson,
     wilson,
 )
-from robostats.records import SCHEMA_VERSION
+from robostats.records import SCHEMA_VERSION, PairedResult
 
 Method = Callable[[int, int, float], ConfidenceInterval]
 
@@ -66,6 +68,10 @@ CONFIDENCE_LEVELS = (0.90, 0.95, 0.99)
 #: suggests, because the full-range mean is dominated by the interior.
 REGION_LOW, REGION_HIGH, REGION_POINTS = 0.85, 0.99, 281
 REGION_SAMPLE_SIZE = 50
+
+#: Sample sizes for the paired enumeration. The number of 2x2 tables at n pairs
+#: is C(n + 3, 3), which grows quickly, so this stays small by design.
+TANGO_SAMPLE_SIZES = (10, 20)
 
 #: Where the committed artifacts live, relative to the repository root.
 ARTIFACT_DIR = Path(__file__).resolve().parents[1] / "results" / "coverage"
@@ -203,6 +209,36 @@ def coverage_curve(
     return np.sum(np.where(contained, pmf, 0.0), axis=1)
 
 
+def expected_width_curve(
+    lower: np.ndarray, upper: np.ndarray, n: int, probabilities: np.ndarray
+) -> np.ndarray:
+    """Expected interval width at every point of ``probabilities``.
+
+    The estimand is ``E_p[upper(X) - lower(X)]`` for ``X ~ Binomial(n, p)``,
+    computed by the same exact enumeration as the coverage: every outcome
+    ``x = 0..n`` weighted by its binomial probability. Reported alongside
+    coverage because coverage alone does not say what it cost: an interval can
+    buy a guarantee by being wide, and width is the price of that guarantee.
+
+    Parameters
+    ----------
+    lower, upper : numpy.ndarray
+        Interval bounds indexed by number of successes, length ``n + 1``.
+    n : int
+        Number of trials.
+    probabilities : numpy.ndarray
+        True success probabilities to evaluate.
+
+    Returns
+    -------
+    numpy.ndarray
+        Expected width at each entry of ``probabilities``, same shape.
+    """
+    successes = np.arange(n + 1)
+    pmf = stats.binom.pmf(successes[None, :], n, probabilities[:, None])
+    return np.sum(pmf * (upper - lower)[None, :], axis=1)
+
+
 @dataclass(frozen=True, slots=True)
 class CoverageSummary:
     """Summary of one method at one ``(n, confidence)`` over the whole grid.
@@ -225,6 +261,9 @@ class CoverageSummary:
         grid, and is a shape summary rather than an estimate of anything.
     below_nominal : int
         How many grid points had coverage strictly below ``confidence``.
+    width_mean, width_min, width_max : float or None
+        Expected interval width across the grid, where it was computed. ``None``
+        for the full-range sweep, which reports coverage only.
     """
 
     method: str
@@ -234,12 +273,20 @@ class CoverageSummary:
     argmin: float
     mean: float
     below_nominal: int
+    width_mean: float | None = None
+    width_min: float | None = None
+    width_max: float | None = None
 
 
 def summarize(
-    method_name: str, n: int, confidence: float, probabilities: np.ndarray, curve: np.ndarray
+    method_name: str,
+    n: int,
+    confidence: float,
+    probabilities: np.ndarray,
+    curve: np.ndarray,
+    width: np.ndarray | None = None,
 ) -> CoverageSummary:
-    """Reduce a coverage curve to the summary written into the README."""
+    """Reduce a coverage curve, and its widths if given, to a README row."""
     index = int(np.argmin(curve))
     return CoverageSummary(
         method=method_name,
@@ -249,7 +296,214 @@ def summarize(
         argmin=float(probabilities[index]),
         mean=float(np.mean(curve)),
         below_nominal=int(np.sum(curve < confidence)),
+        width_mean=None if width is None else float(np.mean(width)),
+        width_min=None if width is None else float(np.min(width)),
+        width_max=None if width is None else float(np.max(width)),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class CellConfiguration:
+    """One true multinomial for the paired 2x2, and the ``delta`` it implies.
+
+    Parameters
+    ----------
+    name : str
+        Short label used in the artifacts.
+    p_both_success, p_a_only, p_b_only, p_both_failure : float
+        The four cell probabilities, summing to 1.
+    """
+
+    name: str
+    p_both_success: float
+    p_a_only: float
+    p_b_only: float
+    p_both_failure: float
+
+    def __post_init__(self) -> None:
+        total = self.p_both_success + self.p_a_only + self.p_b_only + self.p_both_failure
+        if abs(total - 1.0) > 1e-12:
+            raise ValueError(f"cell probabilities of {self.name!r} sum to {total!r}, not 1")
+
+    @property
+    def cells(self) -> tuple[float, float, float, float]:
+        """The four probabilities, in the order the tables are enumerated."""
+        return (self.p_both_success, self.p_a_only, self.p_b_only, self.p_both_failure)
+
+    @property
+    def delta(self) -> float:
+        """The true paired difference, ``p_A - p_B``, which is ``p12 - p21``."""
+        return self.p_a_only - self.p_b_only
+
+
+#: A modest sweep of true cell configurations rather than a dense grid: the
+#: paired parameter space is three dimensional, and what matters here is the
+#: amount of discordance, since the paired test conditions on it. These range
+#: from near-total agreement, where the discordant count is routinely zero, to
+#: tables with no concordance at all.
+TANGO_CONFIGURATIONS: tuple[CellConfiguration, ...] = (
+    CellConfiguration("agree_high", 0.90, 0.03, 0.03, 0.04),
+    CellConfiguration("agree_mid", 0.45, 0.05, 0.05, 0.45),
+    CellConfiguration("rare_discordance", 0.95, 0.02, 0.01, 0.02),
+    CellConfiguration("high_success_small_edge", 0.92, 0.04, 0.02, 0.02),
+    CellConfiguration("small_edge", 0.85, 0.06, 0.03, 0.06),
+    CellConfiguration("moderate_edge", 0.60, 0.20, 0.05, 0.15),
+    CellConfiguration("large_edge", 0.30, 0.45, 0.05, 0.20),
+    CellConfiguration("b_better", 0.60, 0.05, 0.20, 0.15),
+    CellConfiguration("balanced_discordance", 0.40, 0.15, 0.15, 0.30),
+    CellConfiguration("no_concordance", 0.10, 0.45, 0.35, 0.10),
+)
+
+
+def paired_tables(n: int) -> np.ndarray:
+    """Enumerate every paired 2x2 table with ``n`` pairs.
+
+    The outcome space of ``n`` paired scenarios is the set of
+    ``(n11, n12, n21, n22)`` summing to ``n``, of which there are
+    ``C(n + 3, 3)``. Enumerating it is what makes the paired coverage exact:
+    as with the binomial case there is no sampling, only a finite sum.
+
+    Parameters
+    ----------
+    n : int
+        Number of matched scenarios.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(C(n + 3, 3), 4)``, columns in the order
+        ``(n_both_success, n_a_only, n_b_only, n_both_failure)``.
+    """
+    rows = [
+        (n11, n12, n21, n - n11 - n12 - n21)
+        for n11 in range(n + 1)
+        for n12 in range(n - n11 + 1)
+        for n21 in range(n - n11 - n12 + 1)
+    ]
+    return np.array(rows, dtype=int)
+
+
+def paired_interval_bounds(
+    tables: np.ndarray, confidence: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Tango interval bounds for every enumerated table.
+
+    The bounds depend only on the table, not on the true cell probabilities, so
+    they are computed once per ``(n, confidence)`` and reused across every
+    configuration swept.
+    """
+    n = int(tables[0].sum())
+    scenario_ids = tuple(f"scenario_{index:04d}" for index in range(n))
+    intervals = [
+        paired_difference(
+            PairedResult(
+                n_both_success=int(n11),
+                n_a_success_b_failure=int(n12),
+                n_b_success_a_failure=int(n21),
+                n_both_failure=int(n22),
+                scenario_ids=scenario_ids,
+                dropped_from_a=0,
+                dropped_from_b=0,
+                protocol_fingerprints_a=("validation",),
+                protocol_fingerprints_b=("validation",),
+                replicates="strict",
+            ),
+            confidence=confidence,
+        )
+        for n11, n12, n21, n22 in tables
+    ]
+    return (
+        np.array([interval.lower for interval in intervals]),
+        np.array([interval.upper for interval in intervals]),
+    )
+
+
+def multinomial_pmf(tables: np.ndarray, cells: tuple[float, float, float, float]) -> np.ndarray:
+    """Probability of each enumerated table under the given cell probabilities.
+
+    Computed in logs, so the multinomial coefficient at the sample sizes here
+    never overflows. A cell with probability zero contributes nothing unless the
+    table puts counts in it, in which case that table has probability zero.
+    """
+    n = int(tables[0].sum())
+    probabilities = np.array(cells)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_probabilities = np.where(probabilities > 0.0, np.log(probabilities), -np.inf)
+        terms = np.where(tables > 0, tables * log_probabilities[None, :], 0.0)
+    log_pmf = gammaln(n + 1) - np.sum(gammaln(tables + 1), axis=1) + np.sum(terms, axis=1)
+    return np.exp(log_pmf)
+
+
+def tango_coverage(
+    lower: np.ndarray,
+    upper: np.ndarray,
+    tables: np.ndarray,
+    configuration: CellConfiguration,
+) -> float:
+    """Exact coverage of the Tango interval at one true cell configuration.
+
+    The estimand is ``P(lower(T) <= delta <= upper(T))`` where ``T`` is the
+    random 2x2 table under the multinomial with these cell probabilities and
+    ``delta = p12 - p21``. Containment is closed at both ends, as in the
+    binomial case.
+
+    Returns
+    -------
+    float
+        The exact coverage, in ``[0, 1]``.
+    """
+    pmf = multinomial_pmf(tables, configuration.cells)
+    contained = (lower <= configuration.delta) & (configuration.delta <= upper)
+    return float(np.sum(np.where(contained, pmf, 0.0)))
+
+
+def tango_curve(n: int, confidence: float) -> np.ndarray:
+    """Coverage at every configuration in :data:`TANGO_CONFIGURATIONS`."""
+    tables = paired_tables(n)
+    lower, upper = paired_interval_bounds(tables, confidence)
+    return np.array(
+        [tango_coverage(lower, upper, tables, configuration) for configuration in TANGO_CONFIGURATIONS]
+    )
+
+
+def tango_artifact_path(n: int, confidence: float) -> Path:
+    """Return the committed CSV path for one paired configuration sweep."""
+    return ARTIFACT_DIR / f"tango-n{n}-{confidence:.2f}.csv"
+
+
+def write_tango_curve(n: int, confidence: float, curve: np.ndarray) -> tuple[Path, str]:
+    """Write one paired coverage sweep and return its path and digest.
+
+    Every configuration fits in one small file, so there is nothing to
+    downsample: the committed artifact is the full result.
+    """
+    rounded = round_coverage(curve)
+    digest = curve_digest(rounded)
+    tables = paired_tables(n)
+    lines = [
+        f"# schema_version: {SCHEMA_VERSION}",
+        "# region: tango",
+        "# method: tango",
+        f"# n: {n}",
+        f"# confidence: {confidence}",
+        "# estimand: C = P(lower(T) <= delta <= upper(T)) for T ~ Multinomial(n, cells),",
+        "#   delta = p_a_only - p_b_only, containment closed at both ends, computed by",
+        f"#   exact enumeration of all {tables.shape[0]} tables with {n} pairs.",
+        f"# tables: {tables.shape[0]}",
+        f"# configurations: {len(TANGO_CONFIGURATIONS)}",
+        f"# coverage_decimals: {COVERAGE_DECIMALS}",
+        f"# sha256_of_curve: {digest}",
+        "configuration,p_both_success,p_a_only,p_b_only,p_both_failure,delta,coverage",
+    ]
+    for configuration, value in zip(TANGO_CONFIGURATIONS, rounded, strict=True):
+        lines.append(
+            f"{configuration.name},{configuration.p_both_success!r},"
+            f"{configuration.p_a_only!r},{configuration.p_b_only!r},"
+            f"{configuration.p_both_failure!r},{configuration.delta!r},{float(value)!r}"
+        )
+    path = tango_artifact_path(n, confidence)
+    path.write_text("\n".join(lines) + "\n")
+    return path, digest
 
 
 def region_grid() -> np.ndarray:
@@ -267,6 +521,7 @@ class Curve:
     confidence: float
     probabilities: np.ndarray
     coverage: np.ndarray
+    width: np.ndarray | None = None
 
 
 def round_coverage(curve: np.ndarray) -> np.ndarray:
@@ -353,7 +608,7 @@ def csv_header(curve: Curve, rounded: np.ndarray, kept: int, grid_description: s
         f"# rows: {kept}",
         f"# coverage_decimals: {COVERAGE_DECIMALS}",
         f"# sha256_of_full_curve: {curve_digest(rounded)}",
-        "p,coverage",
+        "p,coverage" if curve.width is None else "p,coverage,expected_width",
     ]
 
 
@@ -372,9 +627,12 @@ def write_curve(
     """
     rounded = round_coverage(curve.coverage)
 
+    widths = None if curve.width is None else round_coverage(curve.width)
+
     def rows(selected: np.ndarray) -> list[str]:
         return [
             f"{float(curve.probabilities[index])!r},{float(rounded[index])!r}"
+            + ("" if widths is None else f",{float(widths[index])!r}")
             for index in selected
         ]
 
@@ -390,7 +648,33 @@ def write_curve(
     return committed, full
 
 
-def write_manifest(curves: list[Curve]) -> Path:
+@dataclass(frozen=True, slots=True)
+class ManifestEntry:
+    """One row of the digest manifest."""
+
+    region: str
+    method: str
+    n: int
+    confidence: float
+    points: int
+    rows_committed: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class TangoSummary:
+    """Summary of the paired enumeration at one ``(n, confidence)``."""
+
+    n: int
+    confidence: float
+    minimum: float
+    argmin: str
+    mean: float
+    below_nominal: int
+    tables: int
+
+
+def write_manifest(entries: list[ManifestEntry]) -> Path:
     """Write the digest manifest covering every configuration.
 
     This is what makes the uncommitted full-resolution curves checkable: a
@@ -403,37 +687,45 @@ def write_manifest(curves: list[Curve]) -> Path:
         f"#   {COVERAGE_DECIMALS} decimals, serialized as repr(float) one per line,",
         "#   newline separated with a trailing newline, encoded UTF-8.",
         "# Regenerate the full curves with: uv run python validation/coverage.py",
-        "region,method,n,confidence,grid_points,rows_committed,sha256",
+        "region,method,n,confidence,points,rows_committed,sha256",
     ]
-    for curve in curves:
-        committed = artifact_path(curve.method, curve.n, curve.confidence, curve.region)
-        rows = sum(1 for line in committed.read_text().splitlines() if not line.startswith("#")) - 1
-        lines.append(
-            f"{curve.region},{curve.method},{curve.n},{curve.confidence},"
-            f"{curve.probabilities.size},{rows},{curve_digest(round_coverage(curve.coverage))}"
-        )
+    lines.extend(
+        f"{entry.region},{entry.method},{entry.n},{entry.confidence},"
+        f"{entry.points},{entry.rows_committed},{entry.sha256}"
+        for entry in entries
+    )
     MANIFEST_PATH.write_text("\n".join(lines) + "\n")
     return MANIFEST_PATH
 
 
 def summary_table(summaries: list[CoverageSummary], grid_size: int) -> list[str]:
-    """Render one markdown table of summaries."""
-    lines = [
-        "| method | n | level | min coverage | at p | mean | below nominal |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
-    ]
+    """Render one markdown table of summaries, with widths where they exist."""
+    with_width = any(summary.width_mean is not None for summary in summaries)
+    header = "| method | n | level | min coverage | at p | mean coverage | below nominal |"
+    rule = "| --- | --- | --- | --- | --- | --- | --- |"
+    if with_width:
+        header += " mean width | min width | max width |"
+        rule += " --- | --- | --- |"
+    lines = [header, rule]
     for summary in summaries:
-        lines.append(
+        row = (
             f"| {summary.method} | {summary.n} | {summary.confidence:.2f} "
             f"| {summary.minimum:.4f} | {summary.argmin:.6g} | {summary.mean:.4f} "
             f"| {summary.below_nominal} / {grid_size} |"
         )
+        if with_width:
+            row += (
+                f" {summary.width_mean:.4f} | {summary.width_min:.4f} "
+                f"| {summary.width_max:.4f} |"
+            )
+        lines.append(row)
     return lines
 
 
 def write_readme(
     full_range: list[CoverageSummary],
     region: list[CoverageSummary],
+    tango: list[TangoSummary],
     probabilities: np.ndarray,
     region_probabilities: np.ndarray,
 ) -> Path:
@@ -514,9 +806,48 @@ def write_readme(
             "robot policy success rates typically sit, and it is not the region the",
             "full-range mean above is dominated by.",
             "",
+            "The width columns are `E_p[upper(X) - lower(X)]` under the same enumeration,",
+            "summarized across the region grid. They are here so the cost of a guarantee",
+            "is visible next to the guarantee: a method can buy coverage by being wide,",
+            "and the comparison between methods is not readable from coverage alone.",
+            "These CSVs carry a third column, `expected_width`, per grid point.",
+            "",
         ]
     )
     lines.extend(summary_table(region, region_probabilities.size))
+    lines.extend(
+        [
+            "",
+            "## Paired difference: Tango score interval",
+            "",
+            "The same enumeration principle applied to the paired 2x2. At `n` pairs the",
+            "outcome space is every table `(n11, n12, n21, n22)` summing to `n`, of which",
+            "there are `C(n + 3, 3)`, so the coverage",
+            "",
+            "```",
+            "C = P(lower(T) <= delta <= upper(T)),   T ~ Multinomial(n, cells)",
+            "```",
+            "",
+            "with `delta = p12 - p21` is again an exact finite sum, not a simulation.",
+            "`n` stays small because the table count grows quickly, and the sweep is over",
+            f"{len(TANGO_CONFIGURATIONS)} true cell configurations rather than a dense grid:",
+            "the paired parameter space is three dimensional, and what governs a paired",
+            "test is how much discordance there is, since the test conditions on it.",
+            "",
+            "Tango's interval is a score interval, not an exact one. Nothing here asserts a",
+            "pointwise lower bound on its coverage; the per-configuration values are in the",
+            "`tango-n<N>-<level>.csv` artifacts.",
+            "",
+            "| n | level | tables | min coverage | at configuration | mean | below nominal |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    for summary in tango:
+        lines.append(
+            f"| {summary.n} | {summary.confidence:.2f} | {summary.tables} "
+            f"| {summary.minimum:.4f} | {summary.argmin} | {summary.mean:.4f} "
+            f"| {summary.below_nominal} / {len(TANGO_CONFIGURATIONS)} |"
+        )
     lines.extend(
         [
             "",
@@ -533,9 +864,17 @@ def write_readme(
 
 
 def compute_curves(
-    region: str, probabilities: np.ndarray, sample_sizes: tuple[int, ...]
+    region: str,
+    probabilities: np.ndarray,
+    sample_sizes: tuple[int, ...],
+    with_width: bool = False,
 ) -> list[Curve]:
-    """Enumerate coverage for every method, sample size and level on one grid."""
+    """Enumerate coverage for every method, sample size and level on one grid.
+
+    ``with_width`` also enumerates the expected interval width, which the
+    operating-region sweep reports next to coverage so the cost of a guarantee
+    is visible beside the guarantee.
+    """
     curves: list[Curve] = []
     for method_name, method in METHODS.items():
         for n in sample_sizes:
@@ -549,6 +888,11 @@ def compute_curves(
                         confidence=confidence,
                         probabilities=probabilities,
                         coverage=coverage_curve(lower, upper, n, probabilities),
+                        width=(
+                            expected_width_curve(lower, upper, n, probabilities)
+                            if with_width
+                            else None
+                        ),
                     )
                 )
     return curves
@@ -568,9 +912,11 @@ def sweep() -> tuple[list[CoverageSummary], list[CoverageSummary]]:
     region_description = f"linspace({REGION_LOW}, {REGION_HIGH}, {REGION_POINTS})."
 
     full_curves = compute_curves("full-range", probabilities, SAMPLE_SIZES)
-    region_curves = compute_curves("high-p", region_probabilities, (REGION_SAMPLE_SIZE,))
+    region_curves = compute_curves(
+        "high-p", region_probabilities, (REGION_SAMPLE_SIZE,), with_width=True
+    )
 
-    written: list[Curve] = []
+    entries: list[ManifestEntry] = []
     summaries: dict[str, list[CoverageSummary]] = {"full-range": [], "high-p": []}
     for curves, description in ((full_curves, full_description), (region_curves, region_description)):
         # The downsample keeps every minimum of every configuration on this grid,
@@ -580,7 +926,17 @@ def sweep() -> tuple[list[CoverageSummary], list[CoverageSummary]]:
         indices = downsample_indices(curves[0].probabilities.size, minima)
         for curve in curves:
             write_curve(curve, indices, description)
-            written.append(curve)
+            entries.append(
+                ManifestEntry(
+                    region=curve.region,
+                    method=curve.method,
+                    n=curve.n,
+                    confidence=curve.confidence,
+                    points=curve.probabilities.size,
+                    rows_committed=int(indices.size),
+                    sha256=curve_digest(round_coverage(curve.coverage)),
+                )
+            )
             summaries[curve.region].append(
                 summarize(
                     curve.method,
@@ -588,28 +944,77 @@ def sweep() -> tuple[list[CoverageSummary], list[CoverageSummary]]:
                     curve.confidence,
                     curve.probabilities,
                     round_coverage(curve.coverage),
+                    None if curve.width is None else round_coverage(curve.width),
                 )
             )
 
-    write_manifest(written)
+    tango_summaries: list[TangoSummary] = []
+    for n in TANGO_SAMPLE_SIZES:
+        table_count = paired_tables(n).shape[0]
+        for confidence in CONFIDENCE_LEVELS:
+            curve = round_coverage(tango_curve(n, confidence))
+            _, digest = write_tango_curve(n, confidence, curve)
+            index = int(np.argmin(curve))
+            tango_summaries.append(
+                TangoSummary(
+                    n=n,
+                    confidence=confidence,
+                    minimum=float(curve[index]),
+                    argmin=TANGO_CONFIGURATIONS[index].name,
+                    mean=float(np.mean(curve)),
+                    below_nominal=int(np.sum(curve < confidence)),
+                    tables=table_count,
+                )
+            )
+            entries.append(
+                ManifestEntry(
+                    region="tango",
+                    method="tango",
+                    n=n,
+                    confidence=confidence,
+                    points=len(TANGO_CONFIGURATIONS),
+                    rows_committed=len(TANGO_CONFIGURATIONS),
+                    sha256=digest,
+                )
+            )
+
+    write_manifest(entries)
     write_readme(
-        summaries["full-range"], summaries["high-p"], probabilities, region_probabilities
+        summaries["full-range"],
+        summaries["high-p"],
+        tango_summaries,
+        probabilities,
+        region_probabilities,
     )
-    return summaries["full-range"], summaries["high-p"]
+    return summaries["full-range"], summaries["high-p"], tango_summaries
 
 
 def main() -> None:
-    """Run the sweep and print both summary tables."""
-    full_range, region = sweep()
+    """Run the sweep and print the summary tables."""
+    full_range, region, tango = sweep()
     for title, summaries in (("full range", full_range), (f"p in [{REGION_LOW}, {REGION_HIGH}]", region)):
         print(f"\n{title}")
-        print(f"{'method':<16}{'n':>5}{'level':>7}{'min':>10}{'at p':>12}{'mean':>10}")
+        print(
+            f"{'method':<16}{'n':>5}{'level':>7}{'min':>10}{'at p':>12}{'mean':>10}"
+            f"{'width':>10}"
+        )
         for summary in summaries:
+            width = "" if summary.width_mean is None else f"{summary.width_mean:>10.4f}"
             print(
                 f"{summary.method:<16}{summary.n:>5}{summary.confidence:>7.2f}"
-                f"{summary.minimum:>10.4f}{summary.argmin:>12.6g}{summary.mean:>10.4f}"
+                f"{summary.minimum:>10.4f}{summary.argmin:>12.6g}{summary.mean:>10.4f}{width}"
             )
-    print(f"\nwrote {len(full_range) + len(region)} curves, a manifest and a README to {ARTIFACT_DIR}")
+    print("\npaired difference, Tango score interval")
+    print(f"{'n':>5}{'level':>7}{'tables':>8}{'min':>10}{'at':>26}{'mean':>10}")
+    for summary in tango:
+        print(
+            f"{summary.n:>5}{summary.confidence:>7.2f}{summary.tables:>8}"
+            f"{summary.minimum:>10.4f}{summary.argmin:>26}{summary.mean:>10.4f}"
+        )
+    print(
+        f"\nwrote {len(full_range) + len(region) + len(tango)} curves, a manifest "
+        f"and a README to {ARTIFACT_DIR}"
+    )
 
 
 if __name__ == "__main__":

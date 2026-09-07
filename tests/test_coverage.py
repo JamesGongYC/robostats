@@ -29,6 +29,9 @@ from validation.coverage import (
     REGION_LOW,
     REGION_SAMPLE_SIZE,
     SAMPLE_SIZES,
+    TANGO_CONFIGURATIONS,
+    TANGO_SAMPLE_SIZES,
+    CellConfiguration,
     artifact_path,
     coverage_at,
     coverage_curve,
@@ -36,10 +39,15 @@ from validation.coverage import (
     downsample_indices,
     full_path,
     interval_bounds,
+    multinomial_pmf,
+    paired_interval_bounds,
+    paired_tables,
     probability_grid,
     region_grid,
     round_coverage,
     summarize,
+    tango_artifact_path,
+    tango_coverage,
 )
 
 #: A coarse grid, for the checks that sweep. The dense grid the artifacts use is
@@ -301,3 +309,111 @@ def test_the_sweep_covers_the_configurations_the_brief_requires() -> None:
     assert set(METHODS) == {"wilson", "clopper_pearson", "agresti_coull"}
     assert set(SAMPLE_SIZES) >= {10, 20, 50, 100}
     assert set(CONFIDENCE_LEVELS) >= {0.90, 0.95, 0.99}
+
+
+# --------------------------------------------------------------------------------------
+# The paired enumeration behind the Tango coverage sweep
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n", [1, 2, 5, 8])
+def test_paired_tables_enumerate_the_whole_outcome_space(n: int) -> None:
+    tables = paired_tables(n)
+    # The number of 2x2 tables with n pairs is the number of ways to put n
+    # indistinguishable pairs into 4 cells, C(n + 3, 3).
+    assert tables.shape == (comb(n + 3, 3), 4)
+    assert np.all(tables.sum(axis=1) == n)
+    assert np.all(tables >= 0)
+    assert len({tuple(row) for row in tables.tolist()}) == tables.shape[0]
+
+
+@pytest.mark.parametrize("n", [1, 3, 6])
+@pytest.mark.parametrize(
+    "cells",
+    [(0.25, 0.25, 0.25, 0.25), (0.9, 0.03, 0.03, 0.04), (0.1, 0.45, 0.35, 0.1)],
+)
+def test_multinomial_pmf_sums_to_one_over_the_enumerated_tables(
+    n: int, cells: tuple[float, float, float, float]
+) -> None:
+    # The paired analogue of the binomial partition check: if the enumeration
+    # missed a table, or produced one twice, the total would not be 1.
+    tables = paired_tables(n)
+    assert float(np.sum(multinomial_pmf(tables, cells))) == pytest.approx(1.0, abs=1e-12)
+
+
+@pytest.mark.parametrize("n", [1, 3, 6])
+def test_multinomial_pmf_matches_scipy(n: int) -> None:
+    tables = paired_tables(n)
+    cells = (0.5, 0.2, 0.2, 0.1)
+    expected = stats.multinomial.pmf(tables, n=n, p=cells)
+    assert np.allclose(multinomial_pmf(tables, cells), expected, atol=1e-15)
+
+
+def test_multinomial_pmf_gives_zero_weight_to_impossible_tables() -> None:
+    # A cell with probability zero can still be enumerated; it must contribute
+    # nothing rather than a nan from log(0).
+    tables = paired_tables(2)
+    pmf = multinomial_pmf(tables, (0.5, 0.5, 0.0, 0.0))
+    assert not np.any(np.isnan(pmf))
+    impossible = tables[:, 2] + tables[:, 3] > 0
+    assert np.all(pmf[impossible] == 0.0)
+    assert float(np.sum(pmf)) == pytest.approx(1.0, abs=1e-12)
+
+
+def test_tango_coverage_of_a_hand_checked_case() -> None:
+    # n = 1 pair, all four outcomes equally likely, true delta = 0. Every one of
+    # the four tables gives an interval containing 0:
+    #   (1,0,0,0) and (0,0,0,1) have no discordant pairs, so the interval is
+    #     +/- z**2 / (n + z**2), symmetric about 0;
+    #   (0,1,0,0) has delta_hat = 1 and (0,0,1,0) has delta_hat = -1, and each
+    #     interval still reaches back across 0 with a single pair of evidence.
+    # So the coverage is the total probability of the outcome space.
+    tables = paired_tables(1)
+    configuration = CellConfiguration("uniform", 0.25, 0.25, 0.25, 0.25)
+    assert configuration.delta == 0.0
+    lower, upper = paired_interval_bounds(tables, 0.95)
+    assert np.all(lower <= 0.0) and np.all(upper >= 0.0)
+
+    whole_space = float(np.sum(multinomial_pmf(tables, configuration.cells)))
+    assert tango_coverage(lower, upper, tables, configuration) == whole_space
+
+
+def test_tango_coverage_is_zero_when_no_interval_reaches_the_truth() -> None:
+    # delta = 1 requires every pair discordant in a's favour, which only one
+    # table achieves; the rest cannot reach it.
+    tables = paired_tables(3)
+    lower, upper = paired_interval_bounds(tables, 0.95)
+    impossible = CellConfiguration("all_a", 0.0, 1.0, 0.0, 0.0)
+    assert impossible.delta == 1.0
+    # This configuration puts all its probability on the one table that does
+    # contain delta = 1, so coverage is 1, not 0.
+    assert tango_coverage(lower, upper, tables, impossible) == pytest.approx(1.0, abs=1e-12)
+
+
+@pytest.mark.parametrize("configuration", TANGO_CONFIGURATIONS, ids=lambda value: value.name)
+def test_tango_coverage_is_a_probability(configuration: CellConfiguration) -> None:
+    tables = paired_tables(5)
+    lower, upper = paired_interval_bounds(tables, 0.95)
+    assert 0.0 <= tango_coverage(lower, upper, tables, configuration) <= 1.0
+
+
+def test_cell_configurations_are_proper_distributions() -> None:
+    for configuration in TANGO_CONFIGURATIONS:
+        assert sum(configuration.cells) == pytest.approx(1.0, abs=1e-12)
+        assert all(cell >= 0.0 for cell in configuration.cells)
+        assert configuration.delta == configuration.p_a_only - configuration.p_b_only
+
+
+def test_cell_configuration_rejects_cells_that_are_not_a_distribution() -> None:
+    with pytest.raises(ValueError, match="sum to"):
+        CellConfiguration("bad", 0.5, 0.2, 0.2, 0.2)
+
+
+def test_tango_artifact_paths_are_named_by_configuration() -> None:
+    assert tango_artifact_path(20, 0.95).name == "tango-n20-0.95.csv"
+
+
+def test_the_paired_sweep_keeps_n_small() -> None:
+    # The table count is C(n + 3, 3); this is the reason the brief caps n here.
+    assert set(TANGO_SAMPLE_SIZES) == {10, 20}
+    assert paired_tables(max(TANGO_SAMPLE_SIZES)).shape[0] == comb(23, 3)

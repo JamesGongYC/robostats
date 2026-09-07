@@ -1,0 +1,23 @@
+# schema_version: 1
+# region: tango
+# method: tango
+# n: 20
+# confidence: 0.95
+# estimand: C = P(lower(T) <= delta <= upper(T)) for T ~ Multinomial(n, cells),
+#   delta = p_a_only - p_b_only, containment closed at both ends, computed by
+#   exact enumeration of all 1771 tables with 20 pairs.
+# tables: 1771
+# configurations: 10
+# coverage_decimals: 12
+# sha256_of_curve: a13f780c459f70f201d44fb46d3396c5a398a87e8fcd8a8af1b4c256afd9d799
+configuration,p_both_success,p_a_only,p_b_only,p_both_failure,delta,coverage
+agree_high,0.9,0.03,0.03,0.04,0.0,0.996759675839
+agree_mid,0.45,0.05,0.05,0.45,0.0,0.986447420321
+rare_discordance,0.95,0.02,0.01,0.02,0.01,0.999936116509
+high_success_small_edge,0.92,0.04,0.02,0.02,0.02,0.998988500069
+small_edge,0.85,0.06,0.03,0.06,0.03,0.995538428012
+moderate_edge,0.6,0.2,0.05,0.15,0.15000000000000002,0.969195341208
+large_edge,0.3,0.45,0.05,0.2,0.4,0.963566197979
+b_better,0.6,0.05,0.2,0.15,-0.15000000000000002,0.969195341208
+balanced_discordance,0.4,0.15,0.15,0.3,0.0,0.951732460164
+no_concordance,0.1,0.45,0.35,0.1,0.10000000000000003,0.949829936048
