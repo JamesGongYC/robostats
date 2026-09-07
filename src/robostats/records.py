@@ -337,6 +337,12 @@ class PairedResult:
 
     Parameters
     ----------
+    policy_id_a, policy_id_b : str
+        The two policies compared, in the order the sides are named throughout.
+        Each side holds exactly one, which :func:`pair` checks before joining,
+        so a paired table always knows what it compared. Carried through because
+        nothing downstream can recover it: a report that cannot name the two
+        policies is describing an anonymous difference.
     n_both_success : int
         Scenarios where both sets succeeded.
     n_a_success_b_failure : int
@@ -369,6 +375,8 @@ class PairedResult:
         re-checked by each consumer.
     """
 
+    policy_id_a: str
+    policy_id_b: str
     n_both_success: int
     n_a_success_b_failure: int
     n_b_success_a_failure: int
@@ -460,8 +468,8 @@ def pair(
     _require_scenario_ids(a, b)
     # Checked before the replicates branch: replicates='first' must never be what
     # silently resolves a set that holds two policies.
-    _require_single_policy(a, "a")
-    _require_single_policy(b, "b")
+    policy_id_a = _require_single_policy(a, "a")
+    policy_id_b = _require_single_policy(b, "b")
 
     if replicates == "mean":
         raise NotImplementedError(
@@ -490,6 +498,8 @@ def pair(
         counts[(outcomes_a[scenario_id], outcomes_b[scenario_id])] += 1
 
     return PairedResult(
+        policy_id_a=policy_id_a,
+        policy_id_b=policy_id_b,
         n_both_success=counts[(True, True)],
         n_a_success_b_failure=counts[(True, False)],
         n_b_success_a_failure=counts[(False, True)],
@@ -524,8 +534,8 @@ def _require_scenario_ids(a: RecordSet, b: RecordSet) -> None:
     )
 
 
-def _require_single_policy(record_set: RecordSet, name: str) -> None:
-    """Raise if ``record_set`` holds more than one distinct ``policy_id``."""
+def _require_single_policy(record_set: RecordSet, name: str) -> str:
+    """Return the one ``policy_id`` in ``record_set``, or raise if there are several."""
     policies = record_set.policies
     if len(policies) > 1:
         raise MixedPolicyError(
@@ -533,6 +543,7 @@ def _require_single_policy(record_set: RecordSet, name: str) -> None:
             f"{len(policies)}: {', '.join(repr(policy) for policy in policies)}. Split it "
             f"with RecordSet.filter(policy_id=...) before pairing."
         )
+    return policies[0]
 
 
 def _collapse(

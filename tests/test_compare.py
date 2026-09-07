@@ -102,6 +102,8 @@ def table(
     *,
     fingerprints_a: tuple[str, ...] = ("fingerprint",),
     fingerprints_b: tuple[str, ...] = ("fingerprint",),
+    policy_id_a: str = "policy_a",
+    policy_id_b: str = "policy_b",
 ) -> PairedResult:
     """Build a :class:`PairedResult` holding these four counts.
 
@@ -110,6 +112,8 @@ def table(
     """
     n_pairs = n_both_success + n_ab + n_ba + n_both_failure
     return PairedResult(
+        policy_id_a=policy_id_a,
+        policy_id_b=policy_id_b,
         n_both_success=n_both_success,
         n_a_success_b_failure=n_ab,
         n_b_success_a_failure=n_ba,
@@ -274,7 +278,11 @@ def test_zero_discordant_pairs_does_not_call_binomtest(monkeypatch: pytest.Monke
     def poisoned(*args: object, **kwargs: object) -> None:
         raise AssertionError("binomtest must not be called when m == 0")
 
-    monkeypatch.setattr("robostats.compare.stats.binomtest", poisoned)
+    # Patched at its source. robostats.compare reaches binomtest through the
+    # scipy.stats module object, and "robostats.compare.stats.binomtest" is not a
+    # usable target: the package re-exports a compare() function under that name,
+    # so the dotted path no longer resolves to the submodule.
+    monkeypatch.setattr("scipy.stats.binomtest", poisoned)
     assert mcnemar(table(10, 0, 0, 5)).p_value == 1.0
 
 
@@ -963,3 +971,37 @@ def test_a_mixed_side_is_reported_as_a_mismatch_even_when_one_protocol_is_unspec
     )
     with pytest.raises(ProtocolMismatchError, match="mixes 2 protocols internally"):
         compare(paired)
+
+
+@pytest.mark.parametrize("counts", TABLES, ids=str)
+def test_compare_carries_the_policy_ids_and_dropped_counts(
+    counts: tuple[int, int, int, int]
+) -> None:
+    # Everything a report needs to say what was compared, and over how much of
+    # it. Neither is recoverable downstream, so compare() carries both.
+    paired = table(*counts, policy_id_a="pi_zero", policy_id_b="octo")
+    result = compare(paired)
+    assert result.policy_id_a == "pi_zero"
+    assert result.policy_id_b == "octo"
+    assert result.dropped_from_a == paired.dropped_from_a
+    assert result.dropped_from_b == paired.dropped_from_b
+
+
+def test_compare_carries_nonzero_dropped_counts() -> None:
+    paired = PairedResult(
+        policy_id_a="pi_zero",
+        policy_id_b="octo",
+        n_both_success=10,
+        n_a_success_b_failure=3,
+        n_b_success_a_failure=1,
+        n_both_failure=6,
+        scenario_ids=tuple(f"scenario_{index:04d}" for index in range(20)),
+        dropped_from_a=4,
+        dropped_from_b=7,
+        protocol_fingerprints_a=("fingerprint",),
+        protocol_fingerprints_b=("fingerprint",),
+        replicates="strict",
+    )
+    result = compare(paired)
+    assert (result.dropped_from_a, result.dropped_from_b) == (4, 7)
+    assert result.n_pairs == 20

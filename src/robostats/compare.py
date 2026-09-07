@@ -464,6 +464,9 @@ class ComparisonResult:
 
     Parameters
     ----------
+    policy_id_a, policy_id_b : str
+        The two policies compared. ``delta`` is ``p_A - p_B`` in these terms, so
+        a result that could not name them would not say which direction it is.
     delta : float
         Point estimate of ``p_A - p_B``.
     interval : ConfidenceInterval
@@ -478,6 +481,11 @@ class ComparisonResult:
         Number of scenarios the two policies disagreed on.
     n_both_success, n_a_success_b_failure, n_b_success_a_failure, n_both_failure : int
         The four cells of the 2x2 table the comparison was computed from.
+    dropped_from_a, dropped_from_b : int
+        Scenarios present in one side but not the other, and so not paired.
+        Carried so a report can state them: a comparison over 40 of 50 scenarios
+        is a different claim from one over all 50, and the difference is
+        invisible in ``n_pairs`` alone.
     confidence : float
         Nominal confidence level of ``interval``.
     protocol_mismatch : bool
@@ -497,6 +505,8 @@ class ComparisonResult:
         The record schema version this comparison was computed under.
     """
 
+    policy_id_a: str
+    policy_id_b: str
     delta: float
     interval: ConfidenceInterval
     p_value: float
@@ -507,6 +517,8 @@ class ComparisonResult:
     n_a_success_b_failure: int
     n_b_success_a_failure: int
     n_both_failure: int
+    dropped_from_a: int
+    dropped_from_b: int
     confidence: float
     protocol_mismatch: bool
     protocol_unspecified: bool
@@ -602,6 +614,8 @@ def compare(
     test = mcnemar(paired, method=method)
     interval = paired_difference(paired, confidence=confidence)
     return ComparisonResult(
+        policy_id_a=paired.policy_id_a,
+        policy_id_b=paired.policy_id_b,
         delta=test.delta,
         interval=interval,
         p_value=test.p_value,
@@ -612,6 +626,8 @@ def compare(
         n_a_success_b_failure=paired.n_a_success_b_failure,
         n_b_success_a_failure=paired.n_b_success_a_failure,
         n_both_failure=paired.n_both_failure,
+        dropped_from_a=paired.dropped_from_a,
+        dropped_from_b=paired.dropped_from_b,
         confidence=confidence,
         protocol_mismatch=protocol_mismatch,
         protocol_unspecified=protocol_unspecified,

@@ -512,6 +512,8 @@ def test_paired_result_rejects_a_table_with_no_pairs() -> None:
     # each statistic defined on a paired table divides by n_pairs.
     with pytest.raises(EmptyRecordSetError, match="all four"):
         PairedResult(
+            policy_id_a="a",
+            policy_id_b="b",
             n_both_success=0,
             n_a_success_b_failure=0,
             n_b_success_a_failure=0,
@@ -527,6 +529,8 @@ def test_paired_result_rejects_a_table_with_no_pairs() -> None:
 
 def test_paired_result_accepts_a_table_with_one_pair() -> None:
     single = PairedResult(
+        policy_id_a="a",
+        policy_id_b="b",
         n_both_success=1,
         n_a_success_b_failure=0,
         n_b_success_a_failure=0,
@@ -540,3 +544,20 @@ def test_paired_result_accepts_a_table_with_one_pair() -> None:
     )
     assert single.n_pairs == 1
     assert single.n_discordant == 0
+
+
+def test_pair_records_both_policy_ids() -> None:
+    a = RecordSet([record("pi_zero", "s0"), record("pi_zero", "s1", success=False)])
+    b = RecordSet([record("octo", "s0", success=False), record("octo", "s1", success=False)])
+    matched = pair(a, b)
+    # Taken from the single-policy check pair() already performs, so a paired
+    # table always knows what it compared.
+    assert matched.policy_id_a == "pi_zero"
+    assert matched.policy_id_b == "octo"
+
+
+def test_pair_keeps_the_policy_ids_in_the_order_the_sides_were_given() -> None:
+    a = RecordSet([record("pi_zero", "s0")])
+    b = RecordSet([record("octo", "s0", success=False)])
+    assert (pair(a, b).policy_id_a, pair(a, b).policy_id_b) == ("pi_zero", "octo")
+    assert (pair(b, a).policy_id_a, pair(b, a).policy_id_b) == ("octo", "pi_zero")
