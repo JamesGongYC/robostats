@@ -430,3 +430,110 @@ def test_every_load_error_names_the_file(tmp_path: Path) -> None:
     with pytest.raises(LoadError) as caught:
         load_jsonl(path, protocol=PROTOCOL, **MAPPING)
     assert str(path) in str(caught.value)
+
+
+# --------------------------------------------------------------------------------------
+# success_detail: recorded, never thresholded
+# --------------------------------------------------------------------------------------
+
+DETAIL_ROWS = [
+    {**ROWS[0], "score": 1.0},
+    {**ROWS[1], "score": 0.62},
+    {**ROWS[2], "score": 0.95},
+]
+
+
+def test_jsonl_reads_success_detail(tmp_path: Path) -> None:
+    path = write_jsonl(tmp_path / "a.jsonl", DETAIL_ROWS)
+    loaded = load_jsonl(path, protocol=PROTOCOL, **MAPPING, success_detail_field="score")
+    assert [record.success_detail for record in loaded] == [1.0, 0.62, 0.95]
+    # The raw score is recorded and success is read from its own column; the two
+    # are never reconciled by the loader.
+    assert [record.success for record in loaded] == [True, False, True]
+
+
+def test_csv_reads_success_detail(tmp_path: Path) -> None:
+    path = write_csv(tmp_path / "a.csv", csv_rows(DETAIL_ROWS))
+    loaded = load_csv(path, protocol=PROTOCOL, **MAPPING, success_detail_field="score")
+    assert [record.success_detail for record in loaded] == [1.0, 0.62, 0.95]
+    assert [record.success for record in loaded] == [True, False, True]
+
+
+def test_success_detail_is_never_thresholded_into_success(tmp_path: Path) -> None:
+    # A high score with success=false stays exactly that. Deciding that 0.95 is
+    # a success is the caller's threshold to apply, not the loader's.
+    rows = [{**ROWS[0], "success": False, "score": 0.99}]
+    path = write_jsonl(tmp_path / "a.jsonl", rows)
+    record = load_jsonl(path, protocol=PROTOCOL, **MAPPING, success_detail_field="score").records[0]
+    assert record.success is False
+    assert record.success_detail == 0.99
+
+
+def test_success_detail_is_none_when_unmapped(tmp_path: Path) -> None:
+    path = write_jsonl(tmp_path / "a.jsonl", DETAIL_ROWS)
+    loaded = load_jsonl(path, protocol=PROTOCOL, **MAPPING)
+    assert all(record.success_detail is None for record in loaded)
+
+
+def test_a_row_carrying_a_score_but_no_success_is_a_load_error(tmp_path: Path) -> None:
+    # success_detail can never stand in for success. The success column is
+    # mapped and missing on this row, so the row fails rather than being read
+    # from its score.
+    rows = [dict(DETAIL_ROWS[0]), {k: v for k, v in DETAIL_ROWS[1].items() if k != "success"}]
+    path = write_jsonl(tmp_path / "a.jsonl", rows)
+    with pytest.raises(LoadError) as caught:
+        load_jsonl(path, protocol=PROTOCOL, **MAPPING, success_detail_field="score")
+    message = str(caught.value)
+    assert "line 2" in message
+    assert "'success'" in message
+    assert "'score'" in message
+
+
+def test_an_integer_score_reads_as_a_float(tmp_path: Path) -> None:
+    path = write_jsonl(tmp_path / "a.jsonl", [{**ROWS[0], "score": 1}])
+    record = load_jsonl(path, protocol=PROTOCOL, **MAPPING, success_detail_field="score").records[0]
+    assert record.success_detail == 1.0
+    assert isinstance(record.success_detail, float)
+
+
+def test_a_null_or_empty_score_reads_as_none(tmp_path: Path) -> None:
+    jsonl = write_jsonl(tmp_path / "a.jsonl", [{**ROWS[0], "score": None}])
+    assert (
+        load_jsonl(jsonl, protocol=PROTOCOL, **MAPPING, success_detail_field="score")
+        .records[0]
+        .success_detail
+        is None
+    )
+    rows = csv_rows([{**ROWS[0], "score": ""}])
+    csv_path = write_csv(tmp_path / "a.csv", rows)
+    assert (
+        load_csv(csv_path, protocol=PROTOCOL, **MAPPING, success_detail_field="score")
+        .records[0]
+        .success_detail
+        is None
+    )
+
+
+def test_a_non_numeric_score_names_the_row_and_the_value(tmp_path: Path) -> None:
+    rows = csv_rows([DETAIL_ROWS[0], {**DETAIL_ROWS[1], "score": "partial"}])
+    path = write_csv(tmp_path / "a.csv", rows)
+    with pytest.raises(LoadError) as caught:
+        load_csv(path, protocol=PROTOCOL, **MAPPING, success_detail_field="score")
+    message = str(caught.value)
+    assert "line 3" in message
+    assert "'partial'" in message
+    assert "success_detail" in message
+
+
+def test_a_boolean_score_is_rejected(tmp_path: Path) -> None:
+    # A JSON boolean is an outcome, not a partial score; accepting it here would
+    # be the loader quietly agreeing that the two fields are interchangeable.
+    path = write_jsonl(tmp_path / "a.jsonl", [{**ROWS[0], "score": True}])
+    with pytest.raises(LoadError, match="must be a JSON number or null"):
+        load_jsonl(path, protocol=PROTOCOL, **MAPPING, success_detail_field="score")
+
+
+def test_a_mapped_score_column_must_exist(tmp_path: Path) -> None:
+    path = write_csv(tmp_path / "a.csv", csv_rows(ROWS))
+    with pytest.raises(LoadError, match=r"missing mapped column\(s\) 'score'"):
+        load_csv(path, protocol=PROTOCOL, **MAPPING, success_detail_field="score")

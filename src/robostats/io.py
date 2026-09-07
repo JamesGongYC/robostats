@@ -63,6 +63,7 @@ def load_jsonl(
     episode_idx_field: str | None = None,
     seed_field: str | None = None,
     run_id_field: str | None = None,
+    success_detail_field: str | None = None,
 ) -> RecordSet:
     """Load records from a JSON Lines file, one record object per line.
 
@@ -89,6 +90,11 @@ def load_jsonl(
         Keys for the optional provenance fields. ``None`` means the field is not
         mapped and is left as ``None`` on every record; naming a key means that
         key must be present on every line.
+    success_detail_field : str or None
+        Key holding a raw partial or continuous score, recorded as
+        ``success_detail``. It is never thresholded into ``success``, which the
+        caller maps separately: mapping a score here says what the harness
+        reported, not whether the episode succeeded.
 
     Returns
     -------
@@ -132,8 +138,10 @@ def load_jsonl(
                 episode_idx_field=episode_idx_field,
                 seed_field=seed_field,
                 run_id_field=run_id_field,
+                success_detail_field=success_detail_field,
                 read_success=_json_success,
                 read_integer=_json_integer,
+                read_number=_json_number,
             )
         )
     if not records:
@@ -152,6 +160,7 @@ def load_csv(
     episode_idx_field: str | None = None,
     seed_field: str | None = None,
     run_id_field: str | None = None,
+    success_detail_field: str | None = None,
     success_true_values: Sequence[str] = DEFAULT_TRUE_VALUES,
     success_false_values: Sequence[str] = DEFAULT_FALSE_VALUES,
 ) -> RecordSet:
@@ -173,6 +182,10 @@ def load_csv(
         Columns for the optional provenance fields. ``None`` means unmapped;
         naming a column means it must be in the header. An empty cell reads as
         ``None``.
+    success_detail_field : str or None
+        Column holding a raw partial or continuous score, recorded as
+        ``success_detail``. It is never thresholded into ``success``, which the
+        caller maps separately through ``success_field`` and its value sets.
     success_true_values, success_false_values : Sequence[str]
         The cell values that mean ``True`` and ``False``. CSV has no boolean
         type, so this is the caller's decision rather than the loader's. A cell
@@ -205,6 +218,7 @@ def load_csv(
         episode_idx_field=episode_idx_field,
         seed_field=seed_field,
         run_id_field=run_id_field,
+        success_detail_field=success_detail_field,
     )
     missing = [column for column in mapped if column not in reader.fieldnames]
     if missing:
@@ -230,8 +244,10 @@ def load_csv(
             episode_idx_field=episode_idx_field,
             seed_field=seed_field,
             run_id_field=run_id_field,
+            success_detail_field=success_detail_field,
             read_success=read_success,
             read_integer=_csv_integer,
+            read_number=_csv_number,
         )
         for row in reader
     ]
@@ -281,11 +297,14 @@ def _mapped_columns(
     episode_idx_field: str | None,
     seed_field: str | None,
     run_id_field: str | None,
+    success_detail_field: str | None,
 ) -> list[str]:
     """Return every column the caller mapped, in a stable order, without repeats."""
     candidates = [policy_id_field, task_id_field, success_field, *scenario_fields]
     candidates.extend(
-        field for field in (episode_idx_field, seed_field, run_id_field) if field is not None
+        field
+        for field in (episode_idx_field, seed_field, run_id_field, success_detail_field)
+        if field is not None
     )
     seen: list[str] = []
     for column in candidates:
@@ -354,6 +373,28 @@ def _csv_integer(value: object, where: str, field: str) -> int | None:
         raise LoadError(f"{where}: {field} is {value!r}, which is not an integer") from error
 
 
+def _json_number(value: object, where: str, field: str) -> float | None:
+    """Read a JSON value as an optional float, strictly."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise LoadError(
+            f"{where}: {field} is {value!r} ({type(value).__name__}), but must be a JSON "
+            f"number or null"
+        )
+    return float(value)
+
+
+def _csv_number(value: object, where: str, field: str) -> float | None:
+    """Read a CSV cell as an optional float. An empty cell is ``None``."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as error:
+        raise LoadError(f"{where}: {field} is {value!r}, which is not a number") from error
+
+
 def _compose_scenario_id(
     row: Mapping[str, Any], scenario_fields: Sequence[str], location: _Location
 ) -> str | None:
@@ -377,8 +418,10 @@ def _build_record(
     episode_idx_field: str | None,
     seed_field: str | None,
     run_id_field: str | None,
+    success_detail_field: str | None,
     read_success: Any,
     read_integer: Any,
+    read_number: Any,
 ) -> EpisodeRecord:
     """Build one record from one row, or raise a LoadError naming where it failed."""
     where = str(location)
@@ -396,6 +439,15 @@ def _build_record(
         else read_integer(_require(row, seed_field, location, "seed"), where, "seed")
     )
     run_id_value = None if run_id_field is None else _require(row, run_id_field, location, "run_id")
+    success_detail = (
+        None
+        if success_detail_field is None
+        else read_number(
+            _require(row, success_detail_field, location, "success_detail"),
+            where,
+            "success_detail",
+        )
+    )
     try:
         return EpisodeRecord(
             policy_id=_require(row, policy_id_field, location, "policy_id"),
@@ -405,6 +457,7 @@ def _build_record(
             protocol=protocol,
             episode_idx=episode_idx,
             seed=seed,
+            success_detail=success_detail,
             run_id=None if run_id_value is None else str(run_id_value),
         )
     except SchemaError as error:
