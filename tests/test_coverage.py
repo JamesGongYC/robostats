@@ -29,8 +29,12 @@ from validation.coverage import (
     REGION_LOW,
     REGION_SAMPLE_SIZE,
     SAMPLE_SIZES,
+    SIMPLEX_DENOMINATOR,
+    SIMPLEX_STEP,
     TANGO_CONFIGURATIONS,
+    TANGO_NAMED_CONFIGURATIONS,
     TANGO_SAMPLE_SIZES,
+    TIERS,
     CellConfiguration,
     artifact_path,
     coverage_at,
@@ -48,6 +52,7 @@ from validation.coverage import (
     summarize,
     tango_artifact_path,
     tango_coverage,
+    tier_of,
 )
 
 #: A coarse grid, for the checks that sweep. The dense grid the artifacts use is
@@ -390,11 +395,19 @@ def test_tango_coverage_is_zero_when_no_interval_reaches_the_truth() -> None:
     assert tango_coverage(lower, upper, tables, impossible) == pytest.approx(1.0, abs=1e-12)
 
 
-@pytest.mark.parametrize("configuration", TANGO_CONFIGURATIONS, ids=lambda value: value.name)
-def test_tango_coverage_is_a_probability(configuration: CellConfiguration) -> None:
+def test_tango_coverage_is_a_probability() -> None:
+    # The bounds are computed once and reused, which is exactly why the full
+    # sweep can afford a dense simplex grid.
+    # Bounded below by zero exactly, and above by the total probability of the
+    # outcome space, which is 1 only up to the rounding of a sum of 1771 terms.
+    # Same treatment as the binomial case above, for the same reason.
     tables = paired_tables(5)
     lower, upper = paired_interval_bounds(tables, 0.95)
-    assert 0.0 <= tango_coverage(lower, upper, tables, configuration) <= 1.0
+    for configuration in TANGO_CONFIGURATIONS:
+        whole_space = float(np.sum(multinomial_pmf(tables, configuration.cells)))
+        coverage = tango_coverage(lower, upper, tables, configuration)
+        assert 0.0 <= coverage <= whole_space
+        assert whole_space == pytest.approx(1.0, abs=1e-12)
 
 
 def test_cell_configurations_are_proper_distributions() -> None:
@@ -402,6 +415,72 @@ def test_cell_configurations_are_proper_distributions() -> None:
         assert sum(configuration.cells) == pytest.approx(1.0, abs=1e-12)
         assert all(cell >= 0.0 for cell in configuration.cells)
         assert configuration.delta == configuration.p_a_only - configuration.p_b_only
+
+
+# --------------------------------------------------------------------------------------
+# The simplex grid and its tiers
+# --------------------------------------------------------------------------------------
+
+
+def test_the_simplex_grid_enumerates_the_whole_simplex() -> None:
+    # Compositions of SIMPLEX_DENOMINATOR into 4 cells, so C(d + 3, 3) of them,
+    # plus the named configurations that do not land on the grid.
+    grid = [c for c in TANGO_CONFIGURATIONS if c.name.startswith("grid-")]
+    named = [c for c in TANGO_CONFIGURATIONS if not c.name.startswith("grid-")]
+    assert len(grid) + len(named) == len(TANGO_CONFIGURATIONS)
+    assert len(TANGO_CONFIGURATIONS) >= comb(SIMPLEX_DENOMINATOR + 3, 3)
+    assert len({c.cells for c in TANGO_CONFIGURATIONS}) == len(TANGO_CONFIGURATIONS)
+
+
+def test_every_named_configuration_survives_the_merge() -> None:
+    # A named configuration that lands on the grid renames that point rather
+    # than duplicating it, so all of them must be present exactly once.
+    present = {c.name for c in TANGO_CONFIGURATIONS}
+    for named in TANGO_NAMED_CONFIGURATIONS:
+        assert named.name in present
+    by_cells = {c.cells: c.name for c in TANGO_CONFIGURATIONS}
+    for named in TANGO_NAMED_CONFIGURATIONS:
+        assert by_cells[named.cells] == named.name
+
+
+def test_the_grid_step_is_the_declared_one() -> None:
+    assert SIMPLEX_STEP == pytest.approx(1.0 / SIMPLEX_DENOMINATOR)
+    for configuration in TANGO_CONFIGURATIONS:
+        if configuration.name.startswith("grid-"):
+            for cell in configuration.cells:
+                assert cell * SIMPLEX_DENOMINATOR == pytest.approx(
+                    round(cell * SIMPLEX_DENOMINATOR), abs=1e-12
+                )
+
+
+def test_the_tiers_partition_the_sweep() -> None:
+    assigned = [tier_of(configuration) for configuration in TANGO_CONFIGURATIONS]
+    assert set(assigned) <= set(TIERS)
+    assert len(assigned) == len(TANGO_CONFIGURATIONS)
+    # Every tier is populated, so a summary never reports over an empty set.
+    for tier in TIERS:
+        assert assigned.count(tier) > 0
+
+
+def test_tier_definitions() -> None:
+    assert tier_of(CellConfiguration("i", 0.4, 0.2, 0.3, 0.1)) == "interior"
+    assert tier_of(CellConfiguration("z", 0.0, 0.5, 0.3, 0.2)) == "zero_cell"
+    assert tier_of(CellConfiguration("c+", 0.0, 1.0, 0.0, 0.0)) == "corner"
+    assert tier_of(CellConfiguration("c-", 0.0, 0.0, 1.0, 0.0)) == "corner"
+
+
+def test_there_are_exactly_two_corners_and_both_are_covered() -> None:
+    # delta = +/-1 forces one discordant cell to hold all the probability, so a
+    # single table occurs with probability 1. Its interval reaches the boundary,
+    # so coverage is 1.0 on both sides: the tier is degenerate, not a failure.
+    corners = [c for c in TANGO_CONFIGURATIONS if tier_of(c) == "corner"]
+    assert len(corners) == 2
+    assert sorted(c.delta for c in corners) == [-1.0, 1.0]
+
+    tables = paired_tables(6)
+    lower, upper = paired_interval_bounds(tables, 0.95)
+    for corner in corners:
+        assert tango_coverage(lower, upper, tables, corner) == pytest.approx(1.0, abs=1e-12)
 
 
 def test_cell_configuration_rejects_cells_that_are_not_a_distribution() -> None:

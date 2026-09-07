@@ -132,23 +132,58 @@ C = P(lower(T) <= delta <= upper(T)),   T ~ Multinomial(n, cells)
 ```
 
 with `delta = p12 - p21` is again an exact finite sum, not a simulation.
-`n` stays small because the table count grows quickly, and the sweep is over
-10 true cell configurations rather than a dense grid:
-the paired parameter space is three dimensional, and what governs a paired
-test is how much discordance there is, since the test conditions on it.
+`n` stays small because the table count grows quickly. The sweep over true
+cell configurations is dense: a grid over the cell simplex at step
+`0.05`, which is every `(i, j, k, l)` of non-negative integers
+summing to 20, plus the named configurations below, for
+1775 in all. A dense grid is affordable here because
+the interval depends only on the table, not on the true cell probabilities, so
+the bounds are computed once per `(n, level)` and reused across every
+configuration.
+
+### Reading this against the binomial tables
+
+**The two are not equivalent and should not be compared directly.** The
+binomial `min coverage` above is a minimum over a dense grid of the whole
+parameter range. The Tango figures below are minima over whichever tier is
+named, and the tiers are not pooled, so no single number here is the
+counterpart of the binomial minimum.
+
+The three tiers are:
+
+- **interior**: all four cells positive. The ordinary case.
+- **zero_cell**: an empty cell but `|delta| < 1`. Some tables are impossible,
+  so the outcome space is effectively smaller than the enumeration suggests.
+- **corner**: `delta = +/-1`. One discordant cell holds all the probability,
+  the multinomial is degenerate, and a single table occurs with probability 1.
+  Coverage is 1.0 on both sides, since that table's interval reaches the
+  boundary. This tier is reported separately because it is degenerate, not
+  because it fails.
 
 Tango's interval is a score interval, not an exact one. Nothing here asserts a
-pointwise lower bound on its coverage; the per-configuration values are in the
-`tango-n<N>-<level>.csv` artifacts.
+pointwise lower bound on its coverage; the per-configuration values, with their
+tier, are in the `tango-n<N>-<level>.csv` artifacts.
 
-| n | level | tables | min coverage | at configuration | mean | below nominal |
-| --- | --- | --- | --- | --- | --- | --- |
-| 10 | 0.90 | 286 | 0.8994 | balanced_discordance | 0.9522 | 1 / 10 |
-| 10 | 0.95 | 286 | 0.9449 | no_concordance | 0.9846 | 1 / 10 |
-| 10 | 0.99 | 286 | 0.9937 | no_concordance | 0.9990 | 0 / 10 |
-| 20 | 0.90 | 1771 | 0.8760 | large_edge | 0.9401 | 1 / 10 |
-| 20 | 0.95 | 1771 | 0.9498 | no_concordance | 0.9781 | 1 / 10 |
-| 20 | 0.99 | 1771 | 0.9923 | no_concordance | 0.9979 | 0 / 10 |
+| n | level | tier | configs | min coverage | at | mean | below nominal |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 10 | 0.90 | interior | 973 | 0.8710 | (0.05, 0.45, 0.45, 0.05) | 0.9171 | 292 / 973 |
+| 10 | 0.90 | zero_cell | 800 | 0.8191 | (0, 0.35, 0.65, 0) | 0.9394 | 111 / 800 |
+| 10 | 0.90 | corner | 2 | 1.0000 | (0, 0, 1, 0) | 1.0000 | 0 / 2 |
+| 10 | 0.95 | interior | 973 | 0.9395 | (0.05, 0.4, 0.5, 0.05) | 0.9691 | 49 / 973 |
+| 10 | 0.95 | zero_cell | 800 | 0.9139 | (0, 0, 0.95, 0.05) | 0.9757 | 48 / 800 |
+| 10 | 0.95 | corner | 2 | 1.0000 | (0, 0, 1, 0) | 1.0000 | 0 / 2 |
+| 10 | 0.99 | interior | 973 | 0.9846 | (0.05, 0.05, 0.8, 0.1) | 0.9966 | 42 / 973 |
+| 10 | 0.99 | zero_cell | 800 | 0.9807 | (0, 0.05, 0.9, 0.05) | 0.9960 | 102 / 800 |
+| 10 | 0.99 | corner | 2 | 1.0000 | (0, 0, 1, 0) | 1.0000 | 0 / 2 |
+| 20 | 0.90 | interior | 973 | 0.8760 | (0.05, 0.05, 0.45, 0.45) | 0.8989 | 619 / 973 |
+| 20 | 0.90 | zero_cell | 800 | 0.8441 | (0, 0.2, 0.8, 0) | 0.9180 | 287 / 800 |
+| 20 | 0.90 | corner | 2 | 1.0000 | (0, 0, 1, 0) | 1.0000 | 0 / 2 |
+| 20 | 0.95 | interior | 973 | 0.9436 | (0.05, 0.1, 0.4, 0.45) | 0.9561 | 325 / 973 |
+| 20 | 0.95 | zero_cell | 800 | 0.9245 | (0, 0, 0.95, 0.05) | 0.9692 | 118 / 800 |
+| 20 | 0.95 | corner | 2 | 1.0000 | (0, 0, 1, 0) | 1.0000 | 0 / 2 |
+| 20 | 0.99 | interior | 973 | 0.9873 | (0.05, 0.05, 0.85, 0.05) | 0.9944 | 8 / 973 |
+| 20 | 0.99 | zero_cell | 800 | 0.9830 | (0, 0.25, 0.75, 0) | 0.9949 | 53 / 800 |
+| 20 | 0.99 | corner | 2 | 1.0000 | (0, 0, 1, 0) | 1.0000 | 0 / 2 |
 
 ## Per-configuration curves
 

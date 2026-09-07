@@ -73,6 +73,13 @@ REGION_SAMPLE_SIZE = 50
 #: is C(n + 3, 3), which grows quickly, so this stays small by design.
 TANGO_SAMPLE_SIZES = (10, 20)
 
+#: Step of the grid over the cell simplex. The interval depends only on the
+#: table, not on the true cell probabilities, so the bounds are computed once per
+#: (n, level) and reused across every configuration: a dense grid over the
+#: simplex costs almost nothing beyond the table enumeration itself.
+SIMPLEX_STEP = 0.05
+SIMPLEX_DENOMINATOR = 20
+
 #: Where the committed artifacts live, relative to the repository root.
 ARTIFACT_DIR = Path(__file__).resolve().parents[1] / "results" / "coverage"
 
@@ -336,12 +343,11 @@ class CellConfiguration:
         return self.p_a_only - self.p_b_only
 
 
-#: A modest sweep of true cell configurations rather than a dense grid: the
-#: paired parameter space is three dimensional, and what matters here is the
-#: amount of discordance, since the paired test conditions on it. These range
-#: from near-total agreement, where the discordant count is routinely zero, to
-#: tables with no concordance at all.
-TANGO_CONFIGURATIONS: tuple[CellConfiguration, ...] = (
+#: Interpretable configurations, kept as labelled rows alongside the simplex
+#: grid. These are the ones worth naming: they range from near-total agreement,
+#: where the discordant count is routinely zero, to tables with no concordance
+#: at all.
+TANGO_NAMED_CONFIGURATIONS: tuple[CellConfiguration, ...] = (
     CellConfiguration("agree_high", 0.90, 0.03, 0.03, 0.04),
     CellConfiguration("agree_mid", 0.45, 0.05, 0.05, 0.45),
     CellConfiguration("rare_discordance", 0.95, 0.02, 0.01, 0.02),
@@ -353,6 +359,69 @@ TANGO_CONFIGURATIONS: tuple[CellConfiguration, ...] = (
     CellConfiguration("balanced_discordance", 0.40, 0.15, 0.15, 0.30),
     CellConfiguration("no_concordance", 0.10, 0.45, 0.35, 0.10),
 )
+
+
+def simplex_configurations() -> tuple[CellConfiguration, ...]:
+    """Return the sweep over true cell configurations.
+
+    A grid over the cell simplex at :data:`SIMPLEX_STEP`, which is every
+    ``(i, j, k, l)`` of non-negative integers summing to
+    :data:`SIMPLEX_DENOMINATOR`, unioned with the named configurations. A named
+    configuration that lands on the grid renames that grid point rather than
+    duplicating it; one that does not is appended.
+
+    Returns
+    -------
+    tuple of CellConfiguration
+        In a fixed order, so the artifacts are deterministic.
+    """
+    step = SIMPLEX_DENOMINATOR
+    grid = [
+        CellConfiguration(
+            f"grid-{i}-{j}-{k}-{step - i - j - k}",
+            i / step,
+            j / step,
+            k / step,
+            (step - i - j - k) / step,
+        )
+        for i in range(step + 1)
+        for j in range(step - i + 1)
+        for k in range(step - i - j + 1)
+    ]
+    by_cells = {configuration.cells: index for index, configuration in enumerate(grid)}
+    extra: list[CellConfiguration] = []
+    for named in TANGO_NAMED_CONFIGURATIONS:
+        index = by_cells.get(named.cells)
+        if index is None:
+            extra.append(named)
+        else:
+            grid[index] = named
+    return tuple(grid + extra)
+
+
+#: Every configuration swept: the simplex grid plus the named ones.
+TANGO_CONFIGURATIONS: tuple[CellConfiguration, ...] = simplex_configurations()
+
+#: The three tiers the paired results are reported in. They are not comparable
+#: to each other, so they are never pooled into a single minimum.
+TIERS = ("interior", "zero_cell", "corner")
+
+
+def tier_of(configuration: CellConfiguration) -> str:
+    """Classify one configuration into its reporting tier.
+
+    ``corner`` is ``delta = +/-1``, which forces one discordant cell to hold all
+    the probability: the multinomial is degenerate, a single table occurs with
+    probability 1, and the parameter sits on the boundary of its own space.
+    ``zero_cell`` is any other configuration with an empty cell, where some
+    tables are impossible. ``interior`` is everything with all four cells
+    positive.
+    """
+    if abs(configuration.delta) == 1.0:
+        return "corner"
+    if min(configuration.cells) == 0.0:
+        return "zero_cell"
+    return "interior"
 
 
 def paired_tables(n: int) -> np.ndarray:
@@ -491,13 +560,14 @@ def write_tango_curve(n: int, confidence: float, curve: np.ndarray) -> tuple[Pat
         f"#   exact enumeration of all {tables.shape[0]} tables with {n} pairs.",
         f"# tables: {tables.shape[0]}",
         f"# configurations: {len(TANGO_CONFIGURATIONS)}",
+        f"# simplex_step: {SIMPLEX_STEP}",
         f"# coverage_decimals: {COVERAGE_DECIMALS}",
         f"# sha256_of_curve: {digest}",
-        "configuration,p_both_success,p_a_only,p_b_only,p_both_failure,delta,coverage",
+        "configuration,tier,p_both_success,p_a_only,p_b_only,p_both_failure,delta,coverage",
     ]
     for configuration, value in zip(TANGO_CONFIGURATIONS, rounded, strict=True):
         lines.append(
-            f"{configuration.name},{configuration.p_both_success!r},"
+            f"{configuration.name},{tier_of(configuration)},{configuration.p_both_success!r},"
             f"{configuration.p_a_only!r},{configuration.p_b_only!r},"
             f"{configuration.p_both_failure!r},{configuration.delta!r},{float(value)!r}"
         )
@@ -663,12 +733,19 @@ class ManifestEntry:
 
 @dataclass(frozen=True, slots=True)
 class TangoSummary:
-    """Summary of the paired enumeration at one ``(n, confidence)``."""
+    """Summary of one tier of the paired enumeration at one ``(n, confidence)``.
+
+    The tiers are summarized separately and never pooled: a minimum taken across
+    all three would be a minimum over configurations that are not comparable.
+    """
 
     n: int
     confidence: float
+    tier: str
+    configurations: int
     minimum: float
     argmin: str
+    argmin_cells: tuple[float, float, float, float]
     mean: float
     below_nominal: int
     tables: int
@@ -829,24 +906,48 @@ def write_readme(
             "```",
             "",
             "with `delta = p12 - p21` is again an exact finite sum, not a simulation.",
-            "`n` stays small because the table count grows quickly, and the sweep is over",
-            f"{len(TANGO_CONFIGURATIONS)} true cell configurations rather than a dense grid:",
-            "the paired parameter space is three dimensional, and what governs a paired",
-            "test is how much discordance there is, since the test conditions on it.",
+            "`n` stays small because the table count grows quickly. The sweep over true",
+            "cell configurations is dense: a grid over the cell simplex at step",
+            f"`{SIMPLEX_STEP}`, which is every `(i, j, k, l)` of non-negative integers",
+            f"summing to {SIMPLEX_DENOMINATOR}, plus the named configurations below, for",
+            f"{len(TANGO_CONFIGURATIONS)} in all. A dense grid is affordable here because",
+            "the interval depends only on the table, not on the true cell probabilities, so",
+            "the bounds are computed once per `(n, level)` and reused across every",
+            "configuration.",
+            "",
+            "### Reading this against the binomial tables",
+            "",
+            "**The two are not equivalent and should not be compared directly.** The",
+            "binomial `min coverage` above is a minimum over a dense grid of the whole",
+            "parameter range. The Tango figures below are minima over whichever tier is",
+            "named, and the tiers are not pooled, so no single number here is the",
+            "counterpart of the binomial minimum.",
+            "",
+            "The three tiers are:",
+            "",
+            "- **interior**: all four cells positive. The ordinary case.",
+            "- **zero_cell**: an empty cell but `|delta| < 1`. Some tables are impossible,",
+            "  so the outcome space is effectively smaller than the enumeration suggests.",
+            "- **corner**: `delta = +/-1`. One discordant cell holds all the probability,",
+            "  the multinomial is degenerate, and a single table occurs with probability 1.",
+            "  Coverage is 1.0 on both sides, since that table's interval reaches the",
+            "  boundary. This tier is reported separately because it is degenerate, not",
+            "  because it fails.",
             "",
             "Tango's interval is a score interval, not an exact one. Nothing here asserts a",
-            "pointwise lower bound on its coverage; the per-configuration values are in the",
-            "`tango-n<N>-<level>.csv` artifacts.",
+            "pointwise lower bound on its coverage; the per-configuration values, with their",
+            "tier, are in the `tango-n<N>-<level>.csv` artifacts.",
             "",
-            "| n | level | tables | min coverage | at configuration | mean | below nominal |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
+            "| n | level | tier | configs | min coverage | at | mean | below nominal |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     for summary in tango:
+        cells = ", ".join(f"{cell:g}" for cell in summary.argmin_cells)
         lines.append(
-            f"| {summary.n} | {summary.confidence:.2f} | {summary.tables} "
-            f"| {summary.minimum:.4f} | {summary.argmin} | {summary.mean:.4f} "
-            f"| {summary.below_nominal} / {len(TANGO_CONFIGURATIONS)} |"
+            f"| {summary.n} | {summary.confidence:.2f} | {summary.tier} "
+            f"| {summary.configurations} | {summary.minimum:.4f} | ({cells}) "
+            f"| {summary.mean:.4f} | {summary.below_nominal} / {summary.configurations} |"
         )
     lines.extend(
         [
@@ -948,24 +1049,31 @@ def sweep() -> tuple[list[CoverageSummary], list[CoverageSummary]]:
                 )
             )
 
+    tiers = np.array([tier_of(configuration) for configuration in TANGO_CONFIGURATIONS])
     tango_summaries: list[TangoSummary] = []
     for n in TANGO_SAMPLE_SIZES:
         table_count = paired_tables(n).shape[0]
         for confidence in CONFIDENCE_LEVELS:
             curve = round_coverage(tango_curve(n, confidence))
             _, digest = write_tango_curve(n, confidence, curve)
-            index = int(np.argmin(curve))
-            tango_summaries.append(
-                TangoSummary(
-                    n=n,
-                    confidence=confidence,
-                    minimum=float(curve[index]),
-                    argmin=TANGO_CONFIGURATIONS[index].name,
-                    mean=float(np.mean(curve)),
-                    below_nominal=int(np.sum(curve < confidence)),
-                    tables=table_count,
+            for tier in TIERS:
+                selected = np.flatnonzero(tiers == tier)
+                tier_curve = curve[selected]
+                index = int(selected[int(np.argmin(tier_curve))])
+                tango_summaries.append(
+                    TangoSummary(
+                        n=n,
+                        confidence=confidence,
+                        tier=tier,
+                        configurations=int(selected.size),
+                        minimum=float(curve[index]),
+                        argmin=TANGO_CONFIGURATIONS[index].name,
+                        argmin_cells=TANGO_CONFIGURATIONS[index].cells,
+                        mean=float(np.mean(tier_curve)),
+                        below_nominal=int(np.sum(tier_curve < confidence)),
+                        tables=table_count,
+                    )
                 )
-            )
             entries.append(
                 ManifestEntry(
                     region="tango",
@@ -1005,11 +1113,12 @@ def main() -> None:
                 f"{summary.minimum:>10.4f}{summary.argmin:>12.6g}{summary.mean:>10.4f}{width}"
             )
     print("\npaired difference, Tango score interval")
-    print(f"{'n':>5}{'level':>7}{'tables':>8}{'min':>10}{'at':>26}{'mean':>10}")
+    print(f"{'n':>5}{'level':>7}{'tier':>11}{'configs':>9}{'min':>10}{'at':>22}{'mean':>10}")
     for summary in tango:
+        cells = ",".join(f"{cell:g}" for cell in summary.argmin_cells)
         print(
-            f"{summary.n:>5}{summary.confidence:>7.2f}{summary.tables:>8}"
-            f"{summary.minimum:>10.4f}{summary.argmin:>26}{summary.mean:>10.4f}"
+            f"{summary.n:>5}{summary.confidence:>7.2f}{summary.tier:>11}"
+            f"{summary.configurations:>9}{summary.minimum:>10.4f}{cells:>22}{summary.mean:>10.4f}"
         )
     print(
         f"\nwrote {len(full_range) + len(region) + len(tango)} curves, a manifest "
