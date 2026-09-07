@@ -81,6 +81,12 @@ def wilson(successes: int, n: int, confidence: float = 0.95) -> ConfidenceInterv
     under the null rather than at ``p_hat``, the interval stays inside ``[0, 1]``
     and remains non-degenerate at ``successes == 0`` and ``successes == n``.
 
+    At those two endpoints the closed form reaches the boundary as a difference
+    of two nearly equal quantities, which leaves a sub-1e-16 residual of the
+    wrong sign, so the endpoints are taken analytically instead: the lower bound
+    is exactly 0 at ``successes == 0`` and the upper bound is exactly 1 at
+    ``successes == n``.
+
     Parameters
     ----------
     successes : int
@@ -112,10 +118,12 @@ def wilson(successes: int, n: int, confidence: float = 0.95) -> ConfidenceInterv
     denominator = n + z2
     centre = (successes + z2 / 2.0) / denominator
     half_width = (z / denominator) * np.sqrt(successes * (n - successes) / n + z2 / 4.0)
+    lower = 0.0 if successes == 0 else centre - half_width
+    upper = 1.0 if successes == n else centre + half_width
     return ConfidenceInterval(
         point=successes / n,
-        lower=_clip(centre - half_width),
-        upper=_clip(centre + half_width),
+        lower=_clip(lower),
+        upper=_clip(upper),
         confidence=confidence,
         method="wilson",
     )

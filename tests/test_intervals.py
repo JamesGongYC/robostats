@@ -96,20 +96,37 @@ def test_anchor_agresti_coull_zero_of_twenty_is_clipped() -> None:
 # --------------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(("method", "_oracle"), METHODS, ids=lambda value: str(value))
+@pytest.mark.parametrize("n", GRID_N)
+@pytest.mark.parametrize("confidence", GRID_CONFIDENCE)
+def test_interval_contains_its_own_point_estimate(
+    method: Method, _oracle: str, n: int, confidence: float
+) -> None:
+    # An interval that excludes its own point estimate is not an interval for it.
+    # Exact comparison, not approx: a bound off by 1e-17 in this direction is the
+    # defect being guarded against, not floating-point noise to be tolerated.
+    for successes in range(n + 1):
+        interval = method(successes, n, confidence)
+        assert interval.lower <= interval.point <= interval.upper, (
+            f"{interval.method} at successes={successes}, n={n}, confidence={confidence}: "
+            f"[{interval.lower!r}, {interval.upper!r}] excludes point={interval.point!r}"
+        )
+
+
 @pytest.mark.parametrize(("method", "_oracle"), METHODS)
 @pytest.mark.parametrize("n", [1, 5, 100])
 @pytest.mark.parametrize("confidence", GRID_CONFIDENCE)
 def test_zero_and_full_success_boundaries(
     method: Method, _oracle: str, n: int, confidence: float
 ) -> None:
-    # The lower bound at x = 0 is zero mathematically, but the Wilson and
-    # Agresti-Coull closed forms reach it as a difference of two nearly equal
-    # quantities, so a sub-1e-15 residual is expected and is not clipped away.
+    # The lower bound at x = 0 and the upper bound at x = n are exactly 0 and 1
+    # for every method: Clopper-Pearson and Wilson take them analytically, and
+    # the Agresti-Coull construction overshoots the boundary and is clipped.
     at_zero = method(0, n, confidence)
-    assert at_zero.lower == pytest.approx(0.0, abs=1e-12)
+    assert at_zero.lower == 0.0
     assert 0.0 < at_zero.upper <= 1.0
     at_full = method(n, n, confidence)
-    assert at_full.upper == pytest.approx(1.0, abs=1e-12)
+    assert at_full.upper == 1.0
     assert 0.0 <= at_full.lower < 1.0
 
 
