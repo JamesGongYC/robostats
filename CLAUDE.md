@@ -171,3 +171,5 @@ catch, so it is never the silent default.
 - Statistical functions never mutate their inputs. Record types are frozen.
 - Run everything through uv: `uv run pytest`, `uv run ruff check .`.
 - Line length 100.
+
+Numbers quoted in a brief or a prompt are measurements, not specifications. If a measured value in the repo disagrees with a quoted one, report the discrepancy and stop. Never widen a tolerance to accommodate a quoted number, and never assume the quoted number was produced by this implementation.
