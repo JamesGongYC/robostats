@@ -9,6 +9,7 @@ from __future__ import annotations
 __all__ = [
     "DuplicateScenarioError",
     "EmptyRecordSetError",
+    "LoadError",
     "MissingScenarioIdError",
     "MixedPolicyError",
     "ProtocolMismatchError",
@@ -49,4 +50,14 @@ class ProtocolMismatchError(RobostatsError):
     protocols is the error this package exists to catch, so it is never the
     silent default; callers who mean it pass ``allow_protocol_mismatch=True``,
     and the result then records that the comparison crossed protocols.
+    """
+
+
+class LoadError(RobostatsError):
+    """A file could not be read into records under the mapping the caller gave.
+
+    Every instance names the file, the line or row that failed, and what was
+    expected there. Loading never guesses: a column that is absent, a value that
+    is not recognisably a boolean, or a field the mapping does not name is an
+    error rather than a default.
     """
