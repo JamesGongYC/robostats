@@ -119,17 +119,41 @@ def test_wilson_bounds_are_the_roots_of_the_score_equation(n: int, confidence: f
     # Wilson is the score test inverted, so each bound b is by definition a value
     # of p at which the score statistic |p_hat - p| / sqrt(p (1 - p) / n) equals z.
     # Boundary counts are excluded: at x = 0 and x = n the bounds are 0 and 1,
-    # where the score denominator vanishes and the statistic is undefined. The
-    # observed deviation from z over this grid peaks at 5.1e-12.
+    # where the score denominator vanishes and the statistic is undefined.
+    #
+    # The tolerance is bucketed by how close the bound sits to 0 or 1, because
+    # that is what conditions the check: as b approaches a boundary, p_hat and b
+    # nearly cancel in the numerator while the denominator shrinks, so the ratio
+    # amplifies rounding error. That is a property of evaluating the score
+    # statistic this way, not of the bounds themselves.
+    #
+    # These thresholds are empirical properties of this implementation on this
+    # platform, not mathematical bounds. Observed maxima over the full grid,
+    # with roughly 6-10x headroom left for libm and scipy variation elsewhere:
+    #
+    #     min(b, 1 - b) >= 0.1     observed 3.22e-14   asserted 2e-13
+    #     min(b, 1 - b) in [.01,.1) observed 1.60e-13  asserted 1e-12
+    #     min(b, 1 - b) < 0.01     observed 5.03e-12   asserted 5e-11
+    #
+    # A future failure should be read against those maxima: a deviation that has
+    # grown by an order of magnitude is a change in behaviour, whereas one that
+    # has crept just past a threshold may be platform arithmetic.
     z = stats.norm.ppf(0.5 + confidence / 2.0)
     for successes in range(1, n):
         interval = wilson(successes, n, confidence)
         point = successes / n
         for name, bound in (("lower", interval.lower), ("upper", interval.upper)):
             score = abs(point - bound) / np.sqrt(bound * (1.0 - bound) / n)
-            assert score == pytest.approx(z, abs=1e-9), (
+            edge = min(bound, 1.0 - bound)
+            if edge >= 0.1:
+                tolerance = 2e-13
+            elif edge >= 0.01:
+                tolerance = 1e-12
+            else:
+                tolerance = 5e-11
+            assert score == pytest.approx(z, abs=tolerance), (
                 f"score at the {name} bound for successes={successes}, n={n}, "
-                f"confidence={confidence}"
+                f"confidence={confidence}: bound={bound!r}, min(b, 1-b)={edge!r}"
             )
 
 
@@ -139,12 +163,20 @@ def test_anchor_agresti_coull_zero_of_twenty_is_clipped() -> None:
     # must satisfy. It is not a test inverted, nor an exact coverage statement;
     # it is a Wald interval on pseudo-counts, so the closed form *is* the
     # definition and the only independent check available is arithmetic on it.
-    # Agresti and Coull (1998) "add two successes and two failures": at 95%,
-    # n~ = 20 + z**2 = 23.8415 and p~ = (0 + z**2/2)/n~ = 0.080562, whose Wald
-    # interval runs from -0.0287 to 0.1898. The lower bound must be clipped.
+    # Agresti and Coull (1998) "add two successes and two failures". Re-derived
+    # here to full double precision, independently of intervals.py, at x = 0,
+    # n = 20, 95%, with z = norm.ppf(0.975) = 1.959963984540054:
+    #     n~    = 20 + z**2            = 23.841458820694125
+    #     p~    = (0 + z**2 / 2) / n~  = 0.08056257902640969
+    #     half  = z * sqrt(p~ (1 - p~) / n~)
+    #                                  = 0.10924698151607916
+    #     p~ - half = -0.02868440248966947  (below zero, so the bound is clipped)
+    #     p~ + half =  0.18980956054248885
+    # Asserting at 1e-15 rather than the earlier 5e-7, which reflected only how
+    # few digits the anchor was quoted to. Observed deviation is 0.0.
     interval = agresti_coull(0, 20, 0.95)
     assert interval.lower == 0.0
-    assert interval.upper == pytest.approx(0.1898096, abs=5e-7)
+    assert interval.upper == pytest.approx(0.18980956054248885, abs=1e-15)
 
 
 # --------------------------------------------------------------------------------------
