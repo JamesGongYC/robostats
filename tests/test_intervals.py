@@ -6,6 +6,8 @@ from collections.abc import Callable
 
 import numpy as np
 import pytest
+from scipy import stats
+from scipy.optimize import brentq
 from statsmodels.stats.proportion import proportion_confint
 
 from robostats.intervals import ConfidenceInterval, agresti_coull, clopper_pearson, wilson
@@ -21,6 +23,10 @@ METHODS: list[tuple[Method, str]] = [
 
 GRID_N = [1, 5, 10, 50, 100, 500, 4500]
 GRID_CONFIDENCE = [0.90, 0.95, 0.99]
+
+#: The Clopper-Pearson definitional check root-finds once per bound, which is far
+#: slower than evaluating a closed form, so it runs on the grid without n = 4500.
+GRID_N_ROOTFIND = [n for n in GRID_N if n <= 500]
 
 #: Agreement with the oracle is exact to well inside double precision.
 ORACLE_TOL = 1e-10
@@ -54,35 +60,85 @@ def test_matches_statsmodels_across_the_grid(
 
 
 # --------------------------------------------------------------------------------------
-# Anchor values, independent of statsmodels
+# Definitional checks, independent of statsmodels
+#
+# Clopper-Pearson and Wilson are each defined by an equation their bounds must
+# satisfy, so the tests below solve or evaluate that equation directly rather
+# than restating a number computed by hand. Agresti-Coull has no such defining
+# equation, and keeps a hand-derived anchor; see the comment on its test.
 # --------------------------------------------------------------------------------------
 
 
-def test_anchor_clopper_pearson_zero_successes() -> None:
-    # At x = 0 the exact upper limit collapses to the closed form
-    # 1 - (alpha/2)**(1/n) (Clopper and Pearson 1934), here 1 - 0.025**0.1.
-    interval = clopper_pearson(0, 10, 0.95)
-    assert interval.lower == 0.0
-    assert interval.upper == pytest.approx(0.3084971078, abs=1e-9)
+@pytest.mark.parametrize("n", GRID_N_ROOTFIND)
+@pytest.mark.parametrize("confidence", GRID_CONFIDENCE)
+def test_clopper_pearson_bounds_solve_the_exact_coverage_equations(
+    n: int, confidence: float
+) -> None:
+    # Clopper-Pearson is defined by the two exact-test equations
+    #     P(X >= x | p = lower) = alpha / 2   and   P(X <= x | p = upper) = alpha / 2,
+    # with the lower equation dropped at x = 0 and the upper one at x = n. Solve
+    # each for p with brentq and compare against the beta-quantile form we ship.
+    # The tolerance is set by brentq's convergence, not by our implementation:
+    # the observed deviation over this grid peaks at 1.2e-14.
+    alpha = 1.0 - confidence
+    for successes in range(n + 1):
+        interval = clopper_pearson(successes, n, confidence)
+        if successes > 0:
+            lower = brentq(
+                lambda p, x=successes: stats.binom.sf(x - 1, n, p) - alpha / 2.0,
+                0.0,
+                1.0,
+                xtol=1e-14,
+                rtol=1e-15,
+            )
+            assert interval.lower == pytest.approx(lower, abs=1e-9), (
+                f"lower at successes={successes}, n={n}, confidence={confidence}"
+            )
+        if successes < n:
+            upper = brentq(
+                lambda p, x=successes: stats.binom.cdf(x, n, p) - alpha / 2.0,
+                0.0,
+                1.0,
+                xtol=1e-14,
+                rtol=1e-15,
+            )
+            assert interval.upper == pytest.approx(upper, abs=1e-9), (
+                f"upper at successes={successes}, n={n}, confidence={confidence}"
+            )
 
 
-def test_anchor_clopper_pearson_all_successes() -> None:
-    # The mirror image at x = n: lower = (alpha/2)**(1/n) = 0.025**0.1.
-    interval = clopper_pearson(10, 10, 0.95)
-    assert interval.lower == pytest.approx(0.6915028922, abs=1e-9)
-    assert interval.upper == 1.0
+def test_clopper_pearson_matches_a_verified_reference_value() -> None:
+    # Verified reference supplied with the task: x = 0, n = 10 at 95% has an
+    # upper limit of 0.308497107818761. We agree to 2.2e-16.
+    assert clopper_pearson(0, 10, 0.95).upper == pytest.approx(0.308497107818761, abs=1e-12)
 
 
-def test_anchor_wilson_half_of_one_hundred() -> None:
-    # Wilson (1927) score interval, computed by hand for x = 50, n = 100, z = 1.959964:
-    # centre = (50 + z**2/2) / (100 + z**2) = 0.5 exactly, and
-    # half = z/(100 + z**2) * sqrt(50*50/100 + z**2/4) = 0.0961685.
-    interval = wilson(50, 100, 0.95)
-    assert interval.lower == pytest.approx(0.4038315, abs=5e-7)
-    assert interval.upper == pytest.approx(0.5961685, abs=5e-7)
+@pytest.mark.parametrize("n", GRID_N)
+@pytest.mark.parametrize("confidence", GRID_CONFIDENCE)
+def test_wilson_bounds_are_the_roots_of_the_score_equation(n: int, confidence: float) -> None:
+    # Wilson is the score test inverted, so each bound b is by definition a value
+    # of p at which the score statistic |p_hat - p| / sqrt(p (1 - p) / n) equals z.
+    # Boundary counts are excluded: at x = 0 and x = n the bounds are 0 and 1,
+    # where the score denominator vanishes and the statistic is undefined. The
+    # observed deviation from z over this grid peaks at 5.1e-12.
+    z = stats.norm.ppf(0.5 + confidence / 2.0)
+    for successes in range(1, n):
+        interval = wilson(successes, n, confidence)
+        point = successes / n
+        for name, bound in (("lower", interval.lower), ("upper", interval.upper)):
+            score = abs(point - bound) / np.sqrt(bound * (1.0 - bound) / n)
+            assert score == pytest.approx(z, abs=1e-9), (
+                f"score at the {name} bound for successes={successes}, n={n}, "
+                f"confidence={confidence}"
+            )
 
 
 def test_anchor_agresti_coull_zero_of_twenty_is_clipped() -> None:
+    # Unlike the two tests above, this one is a hand-derived anchor, and that
+    # asymmetry is deliberate: Agresti-Coull has no defining equation its bounds
+    # must satisfy. It is not a test inverted, nor an exact coverage statement;
+    # it is a Wald interval on pseudo-counts, so the closed form *is* the
+    # definition and the only independent check available is arithmetic on it.
     # Agresti and Coull (1998) "add two successes and two failures": at 95%,
     # n~ = 20 + z**2 = 23.8415 and p~ = (0 + z**2/2)/n~ = 0.080562, whose Wald
     # interval runs from -0.0287 to 0.1898. The lower bound must be clipped.
