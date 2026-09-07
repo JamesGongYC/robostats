@@ -26,6 +26,7 @@ from robostats.errors import (
 
 __all__ = [
     "SCHEMA_VERSION",
+    "UNSPECIFIED_PROTOCOL_FINGERPRINT",
     "EpisodeRecord",
     "PairedResult",
     "Protocol",
@@ -88,10 +89,38 @@ class Protocol:
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
+    @property
+    def is_unspecified(self) -> bool:
+        """Whether nothing about this protocol was recorded.
+
+        True when all three named fields are ``None`` and ``extra`` is empty.
+        Such a protocol carries no information, and two of them fingerprint
+        identically, so comparison functions treat this as its own case rather
+        than as a match.
+
+        Returns
+        -------
+        bool
+            ``True`` if every field is unset.
+        """
+        return (
+            self.execution_horizon is None
+            and self.reset_mode is None
+            and self.max_steps is None
+            and not self.extra
+        )
+
 
 def _tagged(value: object) -> list[object]:
     """Return ``value`` paired with its type name, so unlike types never collide."""
     return [type(value).__name__, value]
+
+
+#: Fingerprint of the fully unspecified protocol, ``Protocol()``. A record set
+#: carrying only this fingerprint recorded nothing about how it was collected.
+#: Held as a constant so comparison functions can recognise the case from a
+#: fingerprint alone, which is all a :class:`PairedResult` keeps.
+UNSPECIFIED_PROTOCOL_FINGERPRINT = Protocol().fingerprint()
 
 
 @dataclass(frozen=True, slots=True)

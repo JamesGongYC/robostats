@@ -15,6 +15,7 @@ __all__ = [
     "ProtocolMismatchError",
     "RobostatsError",
     "SchemaError",
+    "UnspecifiedProtocolError",
 ]
 
 
@@ -60,4 +61,18 @@ class LoadError(RobostatsError):
     expected there. Loading never guesses: a column that is absent, a value that
     is not recognisably a boolean, or a field the mapping does not name is an
     error rather than a default.
+    """
+
+
+class UnspecifiedProtocolError(RobostatsError):
+    """Both sides of a comparison recorded no protocol at all.
+
+    A :class:`~robostats.records.Protocol` with every field unset fingerprints
+    identically to any other empty one, so two runs whose protocol nobody
+    recorded pass the fingerprint check trivially. The package's central check
+    would then be most confident exactly where it knows least, which is why an
+    unspecified protocol on both sides is its own error rather than a match.
+
+    It is waived by the same ``allow_protocol_mismatch=True`` as a mismatch, and
+    the result records ``protocol_unspecified`` so a report can say so.
     """

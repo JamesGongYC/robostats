@@ -20,9 +20,13 @@ from dataclasses import dataclass
 from scipy import stats
 from scipy.optimize import brentq
 
-from robostats.errors import ProtocolMismatchError
+from robostats.errors import ProtocolMismatchError, UnspecifiedProtocolError
 from robostats.intervals import ConfidenceInterval
-from robostats.records import SCHEMA_VERSION, PairedResult
+from robostats.records import (
+    SCHEMA_VERSION,
+    UNSPECIFIED_PROTOCOL_FINGERPRINT,
+    PairedResult,
+)
 
 __all__ = [
     "ComparisonResult",
@@ -481,6 +485,11 @@ class ComparisonResult:
         a mismatch was found and waived with ``allow_protocol_mismatch=True``,
         so that a downstream report can state it. An override that leaves no
         trace in the output is not an override, it is a silent defect.
+    protocol_unspecified : bool
+        Whether both sides recorded no protocol at all. Kept distinct from
+        ``protocol_mismatch``: a mismatch means the two protocols are known and
+        differ, while this means neither is known and the check that passed had
+        nothing to compare.
     protocol_fingerprints_a, protocol_fingerprints_b : tuple of str
         The distinct protocol fingerprints found on each side, carried so a
         report can name them without re-reading the records.
@@ -500,6 +509,7 @@ class ComparisonResult:
     n_both_failure: int
     confidence: float
     protocol_mismatch: bool
+    protocol_unspecified: bool
     protocol_fingerprints_a: tuple[str, ...]
     protocol_fingerprints_b: tuple[str, ...]
     schema_version: int = SCHEMA_VERSION
@@ -552,6 +562,12 @@ def compare(
         different protocol fingerprints, or if either side carries more than
         one fingerprint internally. A side that mixed protocols cannot take part
         in a sound comparison, whichever side it is compared against.
+    UnspecifiedProtocolError
+        Unless ``allow_protocol_mismatch=True``, if both sides recorded no
+        protocol at all. Two empty protocols fingerprint identically, so the
+        mismatch check above passes with nothing to compare; that is the one
+        case where a passing check means least, so it is raised rather than
+        allowed to look like agreement.
 
     Notes
     -----
@@ -567,9 +583,21 @@ def compare(
     if not 0.0 < confidence < 1.0:
         raise ValueError(f"confidence must lie strictly inside (0, 1), got {confidence!r}")
 
+    # Mismatch first: one side specified and one not is a mismatch, since their
+    # fingerprints differ, and it is reported as one rather than as an
+    # unspecified comparison.
     protocol_mismatch = _protocol_mismatch(paired)
     if protocol_mismatch and not allow_protocol_mismatch:
         raise ProtocolMismatchError(_protocol_mismatch_message(paired))
+    protocol_unspecified = _protocol_unspecified(paired)
+    if protocol_unspecified and not allow_protocol_mismatch:
+        raise UnspecifiedProtocolError(
+            "both sides recorded no protocol at all: every field of their Protocol is "
+            "unset, so the two fingerprint identically and the protocol check above "
+            "compared nothing. Record the protocol both runs were collected under, or "
+            "pass allow_protocol_mismatch=True to compare anyway; the result then "
+            "records protocol_unspecified=True."
+        )
 
     test = mcnemar(paired, method=method)
     interval = paired_difference(paired, confidence=confidence)
@@ -586,6 +614,7 @@ def compare(
         n_both_failure=paired.n_both_failure,
         confidence=confidence,
         protocol_mismatch=protocol_mismatch,
+        protocol_unspecified=protocol_unspecified,
         protocol_fingerprints_a=paired.protocol_fingerprints_a,
         protocol_fingerprints_b=paired.protocol_fingerprints_b,
         schema_version=SCHEMA_VERSION,
@@ -605,6 +634,15 @@ def _protocol_mismatch(paired: PairedResult) -> bool:
     if len(fingerprints_a) > 1 or len(fingerprints_b) > 1:
         return True
     return set(fingerprints_a) != set(fingerprints_b)
+
+
+def _protocol_unspecified(paired: PairedResult) -> bool:
+    """Whether both sides carry only the fingerprint of a fully unset protocol."""
+    unspecified = (UNSPECIFIED_PROTOCOL_FINGERPRINT,)
+    return (
+        paired.protocol_fingerprints_a == unspecified
+        and paired.protocol_fingerprints_b == unspecified
+    )
 
 
 def _protocol_mismatch_message(paired: PairedResult) -> str:
