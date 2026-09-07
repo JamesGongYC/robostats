@@ -22,13 +22,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from robostats.intervals import ConfidenceInterval, clopper_pearson, wilson
 from validation.coverage import (
     CONFIDENCE_LEVELS,
+    COVERAGE_DECIMALS,
+    DOWNSAMPLE_POINTS,
     METHODS,
+    REGION_HIGH,
+    REGION_LOW,
+    REGION_SAMPLE_SIZE,
     SAMPLE_SIZES,
     artifact_path,
     coverage_at,
     coverage_curve,
+    curve_digest,
+    downsample_indices,
+    full_path,
     interval_bounds,
     probability_grid,
+    region_grid,
+    round_coverage,
     summarize,
 )
 
@@ -208,6 +218,83 @@ def test_artifact_paths_are_named_by_configuration() -> None:
     path = artifact_path("wilson", 20, 0.95)
     assert path.name == "wilson-n20-0.95.csv"
     assert path.parent.name == "coverage"
+    assert artifact_path("wilson", 50, 0.95, "high-p").name == "wilson-n50-0.95-high-p.csv"
+    # The full-resolution twin keeps the same name under the gitignored full/.
+    assert full_path("wilson", 20, 0.95).name == path.name
+    assert full_path("wilson", 20, 0.95).parent.name == "full"
+
+
+# --------------------------------------------------------------------------------------
+# The artifact scheme: rounding, downsampling, digests
+# --------------------------------------------------------------------------------------
+
+
+def test_coverage_is_rounded_before_it_is_written_or_hashed() -> None:
+    # Rounding is what makes the artifacts portable: scipy's beta.ppf can differ
+    # by an ulp on another platform, and a full-precision curve would diff.
+    raw = np.array([0.9500000000000123456, 0.123456789012345678])
+    rounded = round_coverage(raw)
+    assert rounded[0] == pytest.approx(0.95, abs=1e-15)
+    assert rounded[1] == pytest.approx(0.123456789012, abs=1e-15)
+    assert np.all(rounded == np.round(raw, COVERAGE_DECIMALS))
+
+
+def test_digest_is_stable_and_sensitive() -> None:
+    curve = round_coverage(np.array([0.95, 0.9612345678901234, 1.0]))
+    assert curve_digest(curve) == curve_digest(curve.copy())
+    assert len(curve_digest(curve)) == 64
+
+    # A change one decimal above the rounding threshold must move the digest;
+    # a change below it must not, which is the whole point of rounding first.
+    visible = curve.copy()
+    visible[1] += 1e-11
+    assert curve_digest(round_coverage(visible)) != curve_digest(curve)
+    invisible = curve.copy()
+    invisible[1] += 1e-15
+    assert curve_digest(round_coverage(invisible)) == curve_digest(curve)
+
+
+def test_digest_matches_its_documented_serialization() -> None:
+    # The README tells a reader how to recompute this. If that recipe drifts from
+    # the code, the manifest stops being checkable by anyone but us.
+    import hashlib
+
+    curve = round_coverage(np.array([0.5, 0.25]))
+    expected = hashlib.sha256(b"0.5\n0.25\n").hexdigest()
+    assert curve_digest(curve) == expected
+
+
+def test_downsampling_keeps_every_minimum_it_is_given() -> None:
+    minima = {0, 7, 1234, 2398}
+    indices = downsample_indices(2399, minima)
+    assert minima <= set(indices.tolist())
+    assert indices.size <= DOWNSAMPLE_POINTS + len(minima)
+    assert np.all(np.diff(indices) > 0)
+    assert indices[0] == 0
+    assert indices[-1] == 2398
+
+
+def test_a_grid_smaller_than_the_downsample_target_is_kept_whole() -> None:
+    indices = downsample_indices(281, set())
+    assert indices.tolist() == list(range(281))
+
+
+def test_region_grid_covers_the_operating_range() -> None:
+    grid = region_grid()
+    assert grid[0] == REGION_LOW
+    assert grid[-1] == pytest.approx(REGION_HIGH)
+    assert np.all(np.diff(grid) > 0)
+    # The values the region is reported at must actually be on the grid.
+    for probability in (0.92, 0.98, 0.99):
+        assert np.any(np.isclose(grid, probability, atol=1e-12))
+
+
+def test_clopper_pearson_holds_the_theorem_in_the_operating_region() -> None:
+    # The region is where robot success rates sit, and it is close enough to 1
+    # that the sawtooth is coarse there. The guarantee still holds.
+    lower, upper = interval_bounds(clopper_pearson, REGION_SAMPLE_SIZE, 0.95)
+    curve = coverage_curve(lower, upper, REGION_SAMPLE_SIZE, region_grid())
+    assert float(np.min(curve)) >= 0.95
 
 
 def test_the_sweep_covers_the_configurations_the_brief_requires() -> None:

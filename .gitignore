@@ -10,3 +10,7 @@ wheels/
 .venv
 .venv/
 __pycache__/
+
+# Full-resolution coverage curves: regenerate with `uv run python validation/coverage.py`.
+# The committed downsamples and manifest.csv under results/coverage/ are the checkable record.
+results/coverage/full/

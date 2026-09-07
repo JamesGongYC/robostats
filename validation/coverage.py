@@ -26,6 +26,7 @@ which rewrites every artifact under ``results/coverage/``.
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -59,8 +60,34 @@ METHODS: dict[str, Method] = {
 SAMPLE_SIZES = (10, 20, 50, 100)
 CONFIDENCE_LEVELS = (0.90, 0.95, 0.99)
 
+#: A second, focused region: the high success rates where robot policy
+#: evaluation actually sits. Swept at one sample size, on its own grid, and
+#: reported as its own table. Coverage here is not what the full-range summary
+#: suggests, because the full-range mean is dominated by the interior.
+REGION_LOW, REGION_HIGH, REGION_POINTS = 0.85, 0.99, 281
+REGION_SAMPLE_SIZE = 50
+
 #: Where the committed artifacts live, relative to the repository root.
 ARTIFACT_DIR = Path(__file__).resolve().parents[1] / "results" / "coverage"
+
+#: Full-resolution curves are written here and are gitignored. They are large,
+#: and their low-order digits are not portable: scipy's beta.ppf can differ by an
+#: ulp on another OS or BLAS, which would show up as a spurious diff in CI.
+FULL_DIR = ARTIFACT_DIR / "full"
+
+#: The manifest that makes the full-resolution curves checkable without
+#: committing them: one SHA-256 per configuration over the rounded curve.
+MANIFEST_PATH = ARTIFACT_DIR / "manifest.csv"
+
+#: Coverage is rounded to this many decimals before anything is written or
+#: hashed. Twelve decimals is far finer than any coverage difference that means
+#: something, and coarse enough to survive a one-ulp difference in beta.ppf.
+COVERAGE_DECIMALS = 12
+
+#: How many grid points the committed CSVs keep. The full grid is downsampled to
+#: roughly this many points, plus every point at which some configuration attains
+#: its minimum, so no minimum is lost to downsampling.
+DOWNSAMPLE_POINTS = 300
 
 #: Grid construction. Coverage of these methods is a sawtooth that jumps wherever
 #: p crosses an interval endpoint, and the deepest dips sit very close to 0 and 1,
@@ -225,47 +252,191 @@ def summarize(
     )
 
 
-def artifact_path(method_name: str, n: int, confidence: float) -> Path:
-    """Return the CSV path for one configuration, e.g. ``wilson-n20-0.95.csv``."""
-    return ARTIFACT_DIR / f"{method_name}-n{n}-{confidence:.2f}.csv"
+def region_grid() -> np.ndarray:
+    """Return the grid for the high-success-rate region, ``[0.85, 0.99]``."""
+    return np.linspace(REGION_LOW, REGION_HIGH, REGION_POINTS)
+
+
+@dataclass(frozen=True, slots=True)
+class Curve:
+    """One coverage curve, with everything needed to write and check it."""
+
+    region: str
+    method: str
+    n: int
+    confidence: float
+    probabilities: np.ndarray
+    coverage: np.ndarray
+
+
+def round_coverage(curve: np.ndarray) -> np.ndarray:
+    """Round a coverage curve to :data:`COVERAGE_DECIMALS` decimals."""
+    return np.round(curve, COVERAGE_DECIMALS)
+
+
+def curve_digest(rounded: np.ndarray) -> str:
+    """SHA-256 over a rounded full-resolution curve.
+
+    The hashed bytes are the ``repr`` of each value, one per line, newline
+    separated with a trailing newline, encoded UTF-8. Stating the serialization
+    exactly is what makes the digest reproducible by a reader, and hashing the
+    rounded values rather than the raw ones is what makes it stable across
+    platforms whose ``beta.ppf`` differs in the last ulp.
+
+    Parameters
+    ----------
+    rounded : numpy.ndarray
+        The curve, already passed through :func:`round_coverage`.
+
+    Returns
+    -------
+    str
+        A 64-character lowercase hex digest.
+    """
+    payload = "".join(f"{float(value)!r}\n" for value in rounded)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def downsample_indices(grid_size: int, keep: set[int]) -> np.ndarray:
+    """Choose which grid indices the committed CSV keeps.
+
+    An evenly spaced set of roughly :data:`DOWNSAMPLE_POINTS` indices, unioned
+    with ``keep``: the indices at which some configuration attains its minimum.
+    Downsampling a sawtooth throws away detail by design, but it must never
+    throw away a minimum, since the minima are the whole point of the study.
+
+    Parameters
+    ----------
+    grid_size : int
+        Number of points in the full grid.
+    keep : set of int
+        Indices that must survive downsampling.
+
+    Returns
+    -------
+    numpy.ndarray
+        Sorted, distinct indices into the full grid.
+    """
+    if grid_size <= DOWNSAMPLE_POINTS:
+        return np.arange(grid_size)
+    even = np.linspace(0, grid_size - 1, DOWNSAMPLE_POINTS).round().astype(int)
+    return np.unique(np.concatenate([even, np.fromiter(sorted(keep), dtype=int, count=len(keep))]))
+
+
+def artifact_path(method_name: str, n: int, confidence: float, region: str = "full-range") -> Path:
+    """Return the committed CSV path for one configuration.
+
+    ``wilson-n20-0.95.csv`` for the full-range sweep, and
+    ``wilson-n50-0.95-high-p.csv`` for the focused region.
+    """
+    suffix = "" if region == "full-range" else f"-{region}"
+    return ARTIFACT_DIR / f"{method_name}-n{n}-{confidence:.2f}{suffix}.csv"
+
+
+def full_path(method_name: str, n: int, confidence: float, region: str = "full-range") -> Path:
+    """Return the full-resolution CSV path, under the gitignored ``full/``."""
+    return FULL_DIR / artifact_path(method_name, n, confidence, region).name
+
+
+def csv_header(curve: Curve, rounded: np.ndarray, kept: int, grid_description: str) -> list[str]:
+    """Return the comment header shared by the committed and full-resolution CSVs."""
+    return [
+        f"# schema_version: {SCHEMA_VERSION}",
+        f"# region: {curve.region}",
+        f"# method: {curve.method}",
+        f"# n: {curve.n}",
+        f"# confidence: {curve.confidence}",
+        "# estimand: C(p) = P(lower(X) <= p <= upper(X)) for X ~ Binomial(n, p),",
+        "#   containment closed at both ends, computed by exact enumeration of x = 0..n.",
+        f"# grid: {grid_description}",
+        f"# grid_points: {curve.probabilities.size}",
+        f"# rows: {kept}",
+        f"# coverage_decimals: {COVERAGE_DECIMALS}",
+        f"# sha256_of_full_curve: {curve_digest(rounded)}",
+        "p,coverage",
+    ]
 
 
 def write_curve(
-    method_name: str, n: int, confidence: float, probabilities: np.ndarray, curve: np.ndarray
-) -> Path:
-    """Write one coverage curve to its CSV artifact and return the path.
+    curve: Curve, indices: np.ndarray, grid_description: str
+) -> tuple[Path, Path]:
+    """Write both CSVs for one configuration and return their paths.
 
-    The header records the configuration and how the grid was built, so a reader
-    knows what was and was not sampled. Values are written with ``repr``, which
-    round-trips exactly, so rerunning produces a byte-identical file.
+    The committed file holds the downsampled rows; the full-resolution file, in
+    the gitignored ``full/``, holds every row. Both carry the same digest over
+    the full curve, so the committed file names the thing it was cut down from.
+
+    Values are written with ``repr`` of a Python float, which is the shortest
+    string that round-trips exactly. ``float()`` rather than the numpy scalar:
+    ``repr`` of a numpy scalar carries its type, which is not a CSV value.
     """
-    path = artifact_path(method_name, n, confidence)
+    rounded = round_coverage(curve.coverage)
+
+    def rows(selected: np.ndarray) -> list[str]:
+        return [
+            f"{float(curve.probabilities[index])!r},{float(rounded[index])!r}"
+            for index in selected
+        ]
+
+    committed = artifact_path(curve.method, curve.n, curve.confidence, curve.region)
+    committed.write_text(
+        "\n".join(csv_header(curve, rounded, indices.size, grid_description) + rows(indices)) + "\n"
+    )
+    every = np.arange(curve.probabilities.size)
+    full = full_path(curve.method, curve.n, curve.confidence, curve.region)
+    full.write_text(
+        "\n".join(csv_header(curve, rounded, every.size, grid_description) + rows(every)) + "\n"
+    )
+    return committed, full
+
+
+def write_manifest(curves: list[Curve]) -> Path:
+    """Write the digest manifest covering every configuration.
+
+    This is what makes the uncommitted full-resolution curves checkable: a
+    reader regenerates them and compares digests, rather than diffing 3 MB of
+    CSV whose last digits are not portable anyway.
+    """
     lines = [
         f"# schema_version: {SCHEMA_VERSION}",
-        f"# method: {method_name}",
-        f"# n: {n}",
-        f"# confidence: {confidence}",
-        "# estimand: C(p) = P(lower(X) <= p <= upper(X)) for X ~ Binomial(n, p),",
-        "#   containment closed at both ends, computed by exact enumeration of x = 0..n.",
-        (
-            f"# grid: union of linspace({UNIFORM_LOW}, {UNIFORM_HIGH}, {UNIFORM_POINTS}), "
-            f"logspace({LOG_LOW}, {LOG_HIGH}, {LOG_POINTS}), and its mirror in [1 - x]."
-        ),
-        f"# grid_points: {probabilities.size}",
-        "p,coverage",
+        "# sha256 is over the full-resolution coverage curve, rounded to",
+        f"#   {COVERAGE_DECIMALS} decimals, serialized as repr(float) one per line,",
+        "#   newline separated with a trailing newline, encoded UTF-8.",
+        "# Regenerate the full curves with: uv run python validation/coverage.py",
+        "region,method,n,confidence,grid_points,rows_committed,sha256",
     ]
-    # float(), not the numpy scalar: repr of a numpy scalar carries its type
-    # (`np.float64(1e-06)`), which is not a CSV value. Python's float repr is the
-    # shortest string that round-trips exactly, so nothing is lost.
-    lines.extend(
-        f"{float(probability)!r},{float(value)!r}"
-        for probability, value in zip(probabilities, curve, strict=True)
-    )
-    path.write_text("\n".join(lines) + "\n")
-    return path
+    for curve in curves:
+        committed = artifact_path(curve.method, curve.n, curve.confidence, curve.region)
+        rows = sum(1 for line in committed.read_text().splitlines() if not line.startswith("#")) - 1
+        lines.append(
+            f"{curve.region},{curve.method},{curve.n},{curve.confidence},"
+            f"{curve.probabilities.size},{rows},{curve_digest(round_coverage(curve.coverage))}"
+        )
+    MANIFEST_PATH.write_text("\n".join(lines) + "\n")
+    return MANIFEST_PATH
 
 
-def write_readme(summaries: list[CoverageSummary], probabilities: np.ndarray) -> Path:
+def summary_table(summaries: list[CoverageSummary], grid_size: int) -> list[str]:
+    """Render one markdown table of summaries."""
+    lines = [
+        "| method | n | level | min coverage | at p | mean | below nominal |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for summary in summaries:
+        lines.append(
+            f"| {summary.method} | {summary.n} | {summary.confidence:.2f} "
+            f"| {summary.minimum:.4f} | {summary.argmin:.6g} | {summary.mean:.4f} "
+            f"| {summary.below_nominal} / {grid_size} |"
+        )
+    return lines
+
+
+def write_readme(
+    full_range: list[CoverageSummary],
+    region: list[CoverageSummary],
+    probabilities: np.ndarray,
+    region_probabilities: np.ndarray,
+) -> Path:
     """Write the summary README covering every configuration swept."""
     path = ARTIFACT_DIR / "README.md"
     lines = [
@@ -285,8 +456,27 @@ def write_readme(summaries: list[CoverageSummary], probabilities: np.ndarray) ->
         "",
         "with containment closed at both ends. Every number here is computed by exact",
         "enumeration of the outcome space `x = 0..n`, not by simulation: there is no",
-        "sampling error, no seed, and no replicate count. Rerunning produces",
-        "byte-identical files, so any diff means the code under `src/` changed.",
+        "sampling error, no seed, and no replicate count.",
+        "",
+        "## What is committed",
+        "",
+        f"Coverage is rounded to {COVERAGE_DECIMALS} decimals before anything is written",
+        "or hashed. Full-precision curves are neither committed nor portable: scipy's",
+        "`beta.ppf` can differ by an ulp on another OS or BLAS, which would show up as a",
+        "spurious diff in CI rather than as a real change.",
+        "",
+        f"- `<method>-n<N>-<level>.csv` holds a downsample of roughly {DOWNSAMPLE_POINTS}",
+        "  grid points, chosen to include every point at which some configuration attains",
+        "  its minimum, so no minimum is lost to the downsampling.",
+        "- `manifest.csv` holds one SHA-256 per configuration, taken over the *full*",
+        "  rounded curve. That is what to compare after a change: regenerate and diff the",
+        "  manifest, not the curves.",
+        "- `full/` holds the full-resolution curves and is gitignored. Regenerate it with",
+        "  the command above; the digests in `manifest.csv` say whether what you got",
+        "  matches what was committed.",
+        "",
+        "The digest is over the rounded curve serialized as `repr(float)` per value, one",
+        "per line, newline separated with a trailing newline, encoded UTF-8.",
         "",
         "## Grid",
         "",
@@ -301,30 +491,40 @@ def write_readme(summaries: list[CoverageSummary], probabilities: np.ndarray) ->
         "grid has no points there and reports reassuring numbers that are simply",
         "undersampled, which is why the boundaries are packed log-spaced.",
         "",
-        "`mean` below is the unweighted mean over these grid points. It depends on the",
+        "`mean` below is the unweighted mean over the grid points. It depends on the",
         "grid and is a shape summary, not an estimate of any population quantity.",
         "`below nominal` counts grid points with coverage strictly under the nominal",
         "level; for the approximate methods a nonzero count is expected behaviour of",
         "the method, not a defect.",
         "",
-        "## Summary",
+        "## Summary, full range",
         "",
-        "| method | n | level | min coverage | at p | mean | below nominal |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
-    for summary in summaries:
-        lines.append(
-            f"| {summary.method} | {summary.n} | {summary.confidence:.2f} "
-            f"| {summary.minimum:.4f} | {summary.argmin:.6g} | {summary.mean:.4f} "
-            f"| {summary.below_nominal} / {probabilities.size} |"
-        )
+    lines.extend(summary_table(full_range, probabilities.size))
+    lines.extend(
+        [
+            "",
+            "## Summary, operating region",
+            "",
+            (
+                f"The same enumeration restricted to `p` in "
+                f"`[{REGION_LOW}, {REGION_HIGH}]` at n = {REGION_SAMPLE_SIZE}, on its own grid"
+            ),
+            f"of `linspace({REGION_LOW}, {REGION_HIGH}, {REGION_POINTS})`. This is where",
+            "robot policy success rates typically sit, and it is not the region the",
+            "full-range mean above is dominated by.",
+            "",
+        ]
+    )
+    lines.extend(summary_table(region, region_probabilities.size))
     lines.extend(
         [
             "",
             "## Per-configuration curves",
             "",
-            "One CSV per configuration, named `<method>-n<N>-<level>.csv`, with one row",
-            "per grid point and the configuration recorded in the header comments.",
+            "One CSV per configuration, named `<method>-n<N>-<level>.csv` for the full",
+            "range and `<method>-n<N>-<level>-high-p.csv` for the operating region, with",
+            "one row per retained grid point and the configuration in the header comments.",
             "",
         ]
     )
@@ -332,34 +532,84 @@ def write_readme(summaries: list[CoverageSummary], probabilities: np.ndarray) ->
     return path
 
 
-def sweep() -> list[CoverageSummary]:
-    """Run every configuration, write every artifact, and return the summaries."""
-    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
-    probabilities = probability_grid()
-    summaries: list[CoverageSummary] = []
+def compute_curves(
+    region: str, probabilities: np.ndarray, sample_sizes: tuple[int, ...]
+) -> list[Curve]:
+    """Enumerate coverage for every method, sample size and level on one grid."""
+    curves: list[Curve] = []
     for method_name, method in METHODS.items():
-        for n in SAMPLE_SIZES:
+        for n in sample_sizes:
             for confidence in CONFIDENCE_LEVELS:
                 lower, upper = interval_bounds(method, n, confidence)
-                curve = coverage_curve(lower, upper, n, probabilities)
-                write_curve(method_name, n, confidence, probabilities, curve)
-                summaries.append(
-                    summarize(method_name, n, confidence, probabilities, curve)
+                curves.append(
+                    Curve(
+                        region=region,
+                        method=method_name,
+                        n=n,
+                        confidence=confidence,
+                        probabilities=probabilities,
+                        coverage=coverage_curve(lower, upper, n, probabilities),
+                    )
                 )
-    write_readme(summaries, probabilities)
-    return summaries
+    return curves
+
+
+def sweep() -> tuple[list[CoverageSummary], list[CoverageSummary]]:
+    """Run every configuration, write every artifact, and return the summaries."""
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    FULL_DIR.mkdir(parents=True, exist_ok=True)
+
+    probabilities = probability_grid()
+    region_probabilities = region_grid()
+    full_description = (
+        f"union of linspace({UNIFORM_LOW}, {UNIFORM_HIGH}, {UNIFORM_POINTS}), "
+        f"logspace({LOG_LOW}, {LOG_HIGH}, {LOG_POINTS}), and its mirror in [1 - x]."
+    )
+    region_description = f"linspace({REGION_LOW}, {REGION_HIGH}, {REGION_POINTS})."
+
+    full_curves = compute_curves("full-range", probabilities, SAMPLE_SIZES)
+    region_curves = compute_curves("high-p", region_probabilities, (REGION_SAMPLE_SIZE,))
+
+    written: list[Curve] = []
+    summaries: dict[str, list[CoverageSummary]] = {"full-range": [], "high-p": []}
+    for curves, description in ((full_curves, full_description), (region_curves, region_description)):
+        # The downsample keeps every minimum of every configuration on this grid,
+        # so one configuration's committed CSV also carries its neighbours' worst
+        # points and the curves stay directly comparable row by row.
+        minima = {int(np.argmin(round_coverage(curve.coverage))) for curve in curves}
+        indices = downsample_indices(curves[0].probabilities.size, minima)
+        for curve in curves:
+            write_curve(curve, indices, description)
+            written.append(curve)
+            summaries[curve.region].append(
+                summarize(
+                    curve.method,
+                    curve.n,
+                    curve.confidence,
+                    curve.probabilities,
+                    round_coverage(curve.coverage),
+                )
+            )
+
+    write_manifest(written)
+    write_readme(
+        summaries["full-range"], summaries["high-p"], probabilities, region_probabilities
+    )
+    return summaries["full-range"], summaries["high-p"]
 
 
 def main() -> None:
-    """Run the sweep and print the summary table."""
-    summaries = sweep()
-    print(f"{'method':<16}{'n':>5}{'level':>7}{'min':>10}{'at p':>12}{'mean':>10}")
-    for summary in summaries:
-        print(
-            f"{summary.method:<16}{summary.n:>5}{summary.confidence:>7.2f}"
-            f"{summary.minimum:>10.4f}{summary.argmin:>12.6g}{summary.mean:>10.4f}"
-        )
-    print(f"\nwrote {len(summaries)} curves and a README to {ARTIFACT_DIR}")
+    """Run the sweep and print both summary tables."""
+    full_range, region = sweep()
+    for title, summaries in (("full range", full_range), (f"p in [{REGION_LOW}, {REGION_HIGH}]", region)):
+        print(f"\n{title}")
+        print(f"{'method':<16}{'n':>5}{'level':>7}{'min':>10}{'at p':>12}{'mean':>10}")
+        for summary in summaries:
+            print(
+                f"{summary.method:<16}{summary.n:>5}{summary.confidence:>7.2f}"
+                f"{summary.minimum:>10.4f}{summary.argmin:>12.6g}{summary.mean:>10.4f}"
+            )
+    print(f"\nwrote {len(full_range) + len(region)} curves, a manifest and a README to {ARTIFACT_DIR}")
 
 
 if __name__ == "__main__":

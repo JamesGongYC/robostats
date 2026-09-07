@@ -14,8 +14,27 @@ C(p) = P(lower(X) <= p <= upper(X)),   X ~ Binomial(n, p)
 
 with containment closed at both ends. Every number here is computed by exact
 enumeration of the outcome space `x = 0..n`, not by simulation: there is no
-sampling error, no seed, and no replicate count. Rerunning produces
-byte-identical files, so any diff means the code under `src/` changed.
+sampling error, no seed, and no replicate count.
+
+## What is committed
+
+Coverage is rounded to 12 decimals before anything is written
+or hashed. Full-precision curves are neither committed nor portable: scipy's
+`beta.ppf` can differ by an ulp on another OS or BLAS, which would show up as a
+spurious diff in CI rather than as a real change.
+
+- `<method>-n<N>-<level>.csv` holds a downsample of roughly 300
+  grid points, chosen to include every point at which some configuration attains
+  its minimum, so no minimum is lost to the downsampling.
+- `manifest.csv` holds one SHA-256 per configuration, taken over the *full*
+  rounded curve. That is what to compare after a change: regenerate and diff the
+  manifest, not the curves.
+- `full/` holds the full-resolution curves and is gitignored. Regenerate it with
+  the command above; the digests in `manifest.csv` say whether what you got
+  matches what was committed.
+
+The digest is over the rounded curve serialized as `repr(float)` per value, one
+per line, newline separated with a trailing newline, encoded UTF-8.
 
 ## Grid
 
@@ -30,45 +49,45 @@ interval endpoint, and the deepest dips sit very close to 0 and 1. A uniform
 grid has no points there and reports reassuring numbers that are simply
 undersampled, which is why the boundaries are packed log-spaced.
 
-`mean` below is the unweighted mean over these grid points. It depends on the
+`mean` below is the unweighted mean over the grid points. It depends on the
 grid and is a shape summary, not an estimate of any population quantity.
 `below nominal` counts grid points with coverage strictly under the nominal
 level; for the approximate methods a nonzero count is expected behaviour of
 the method, not a defect.
 
-## Summary
+## Summary, full range
 
 | method | n | level | min coverage | at p | mean | below nominal |
 | --- | --- | --- | --- | --- | --- | --- |
 | wilson | 10 | 0.90 | 0.7966 | 0.0224785 | 0.9235 | 971 / 2399 |
 | wilson | 10 | 0.95 | 0.8383 | 0.0174835 | 0.9600 | 920 / 2399 |
-| wilson | 10 | 0.99 | 0.8909 | 0.988511 | 0.9878 | 922 / 2399 |
+| wilson | 10 | 0.99 | 0.8909 | 0.0114895 | 0.9878 | 922 / 2399 |
 | wilson | 20 | 0.90 | 0.8017 | 0.01099 | 0.9188 | 891 / 2399 |
 | wilson | 20 | 0.95 | 0.8396 | 0.00870359 | 0.9577 | 868 / 2399 |
 | wilson | 20 | 0.99 | 0.8913 | 0.00573844 | 0.9882 | 1069 / 2399 |
 | wilson | 50 | 0.90 | 0.8043 | 0.00434701 | 0.9153 | 911 / 2399 |
 | wilson | 50 | 0.95 | 0.8393 | 0.0034975 | 0.9558 | 869 / 2399 |
-| wilson | 50 | 0.99 | 0.8924 | 0.997726 | 0.9884 | 1094 / 2399 |
+| wilson | 50 | 0.99 | 0.8924 | 0.00227397 | 0.9884 | 1094 / 2399 |
 | wilson | 100 | 0.90 | 0.8047 | 0.00217112 | 0.9129 | 998 / 2399 |
 | wilson | 100 | 0.95 | 0.8416 | 0.00172259 | 0.9547 | 967 / 2399 |
 | wilson | 100 | 0.99 | 0.8926 | 0.00113573 | 0.9884 | 1131 / 2399 |
-| clopper_pearson | 10 | 0.90 | 0.9233 | 0.696803 | 0.9681 | 0 / 2399 |
-| clopper_pearson | 10 | 0.95 | 0.9611 | 0.652847 | 0.9859 | 0 / 2399 |
-| clopper_pearson | 10 | 0.99 | 0.9927 | 0.544455 | 0.9978 | 0 / 2399 |
+| clopper_pearson | 10 | 0.90 | 0.9233 | 0.303197 | 0.9681 | 0 / 2399 |
+| clopper_pearson | 10 | 0.95 | 0.9611 | 0.347153 | 0.9859 | 0 / 2399 |
+| clopper_pearson | 10 | 0.99 | 0.9927 | 0.455545 | 0.9978 | 0 / 2399 |
 | clopper_pearson | 20 | 0.90 | 0.9006 | 0.139361 | 0.9571 | 0 / 2399 |
-| clopper_pearson | 20 | 0.95 | 0.9580 | 0.508491 | 0.9802 | 0 / 2399 |
-| clopper_pearson | 20 | 0.99 | 0.9904 | 0.60989 | 0.9967 | 0 / 2399 |
+| clopper_pearson | 20 | 0.95 | 0.9580 | 0.491509 | 0.9802 | 0 / 2399 |
+| clopper_pearson | 20 | 0.99 | 0.9904 | 0.39011 | 0.9967 | 0 / 2399 |
 | clopper_pearson | 50 | 0.90 | 0.9010 | 0.338162 | 0.9444 | 0 / 2399 |
 | clopper_pearson | 50 | 0.95 | 0.9509 | 0.0714294 | 0.9737 | 0 / 2399 |
-| clopper_pearson | 50 | 0.99 | 0.9900 | 0.666333 | 0.9952 | 0 / 2399 |
+| clopper_pearson | 50 | 0.99 | 0.9900 | 0.333667 | 0.9952 | 0 / 2399 |
 | clopper_pearson | 100 | 0.90 | 0.9021 | 0.127873 | 0.9369 | 0 / 2399 |
-| clopper_pearson | 100 | 0.95 | 0.9505 | 0.696803 | 0.9695 | 0 / 2399 |
-| clopper_pearson | 100 | 0.99 | 0.9902 | 0.678321 | 0.9943 | 0 / 2399 |
+| clopper_pearson | 100 | 0.95 | 0.9505 | 0.303197 | 0.9695 | 0 / 2399 |
+| clopper_pearson | 100 | 0.99 | 0.9902 | 0.321679 | 0.9943 | 0 / 2399 |
 | agresti_coull | 10 | 0.90 | 0.8539 | 0.269231 | 0.9374 | 629 / 2399 |
 | agresti_coull | 10 | 0.95 | 0.9247 | 0.102898 | 0.9704 | 518 / 2399 |
 | agresti_coull | 10 | 0.99 | 0.9685 | 0.0729279 | 0.9931 | 588 / 2399 |
-| agresti_coull | 20 | 0.90 | 0.8668 | 0.716283 | 0.9327 | 625 / 2399 |
-| agresti_coull | 20 | 0.95 | 0.9292 | 0.521478 | 0.9680 | 388 / 2399 |
+| agresti_coull | 20 | 0.90 | 0.8668 | 0.283717 | 0.9327 | 625 / 2399 |
+| agresti_coull | 20 | 0.95 | 0.9292 | 0.478522 | 0.9680 | 388 / 2399 |
 | agresti_coull | 20 | 0.99 | 0.9808 | 0.0809199 | 0.9935 | 539 / 2399 |
 | agresti_coull | 50 | 0.90 | 0.8704 | 0.171329 | 0.9258 | 623 / 2399 |
 | agresti_coull | 50 | 0.95 | 0.9346 | 0.311189 | 0.9648 | 433 / 2399 |
@@ -77,7 +96,27 @@ the method, not a defect.
 | agresti_coull | 100 | 0.95 | 0.9391 | 0.365135 | 0.9625 | 633 / 2399 |
 | agresti_coull | 100 | 0.99 | 0.9876 | 0.365635 | 0.9929 | 455 / 2399 |
 
+## Summary, operating region
+
+The same enumeration restricted to `p` in `[0.85, 0.99]` at n = 50, on its own grid
+of `linspace(0.85, 0.99, 281)`. This is where
+robot policy success rates typically sit, and it is not the region the
+full-range mean above is dominated by.
+
+| method | n | level | min coverage | at p | mean | below nominal |
+| --- | --- | --- | --- | --- | --- | --- |
+| wilson | 50 | 0.90 | 0.8622 | 0.987 | 0.9105 | 104 / 281 |
+| wilson | 50 | 0.95 | 0.8951 | 0.989 | 0.9549 | 101 / 281 |
+| wilson | 50 | 0.99 | 0.9608 | 0.985 | 0.9877 | 164 / 281 |
+| clopper_pearson | 50 | 0.90 | 0.9119 | 0.903 | 0.9504 | 0 / 281 |
+| clopper_pearson | 50 | 0.95 | 0.9509 | 0.9285 | 0.9773 | 0 / 281 |
+| clopper_pearson | 50 | 0.99 | 0.9912 | 0.8945 | 0.9963 | 0 / 281 |
+| agresti_coull | 50 | 0.90 | 0.8754 | 0.878 | 0.9299 | 23 / 281 |
+| agresti_coull | 50 | 0.95 | 0.9469 | 0.8745 | 0.9684 | 6 / 281 |
+| agresti_coull | 50 | 0.99 | 0.9876 | 0.896 | 0.9931 | 46 / 281 |
+
 ## Per-configuration curves
 
-One CSV per configuration, named `<method>-n<N>-<level>.csv`, with one row
-per grid point and the configuration recorded in the header comments.
+One CSV per configuration, named `<method>-n<N>-<level>.csv` for the full
+range and `<method>-n<N>-<level>-high-p.csv` for the operating region, with
+one row per retained grid point and the configuration in the header comments.
