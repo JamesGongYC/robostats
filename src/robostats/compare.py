@@ -20,11 +20,14 @@ from dataclasses import dataclass
 from scipy import stats
 from scipy.optimize import brentq
 
+from robostats.errors import ProtocolMismatchError
 from robostats.intervals import ConfidenceInterval
-from robostats.records import PairedResult
+from robostats.records import SCHEMA_VERSION, PairedResult
 
 __all__ = [
+    "ComparisonResult",
     "McNemarResult",
+    "compare",
     "mcnemar",
     "paired_difference",
 ]
@@ -229,10 +232,9 @@ def paired_difference(paired: PairedResult, *, confidence: float = 0.95) -> Conf
     Returns
     -------
     ConfidenceInterval
-        ``point`` is the estimate of ``delta``, ``lower`` and ``upper`` bound it,
-        and ``method`` is ``"tango"``. Note that ``ConfidenceInterval`` is reused
-        from :mod:`robostats.intervals`, where its docstring describes bounds on
-        a proportion in ``[0, 1]``; here the bounds lie in ``[-1, 1]``.
+        ``point`` is the estimate of ``delta``, ``lower`` and ``upper`` bound it
+        within ``[-1, 1]``, and ``method`` is ``"tango"``. The type is reused
+        from :mod:`robostats.intervals`.
 
     Raises
     ------
@@ -359,12 +361,24 @@ def _tango_score(paired: PairedResult, delta: float) -> float:
     if variance <= 0.0:
         # A zero variance is reached only where the constrained model admits no
         # discordance at all: at the boundary of the feasible range, and at
-        # delta = 0 when the two policies agreed on every scenario. In the
-        # latter case the numerator is zero too, and the statistic is 0/0; it is
-        # taken to be 0, the value that says the data are exactly what the null
-        # predicts, since a table with no discordant pairs is the strongest
-        # possible agreement with delta = 0. Otherwise the observed difference is
-        # impossible under the constraint and the statistic diverges.
+        # delta = 0 when the two policies agreed on every scenario.
+        #
+        # The second case is a removable singularity, not a convention. With
+        # n_ab = n_ba = 0 the constrained MLE is s = max(0, -delta) exactly, so
+        # for delta > 0 the variance is n * delta * (1 - delta) and the numerator
+        # is -n * delta, and the statistic reduces to
+        #
+        #     Z(delta) = -sqrt(n) * sqrt(delta / (1 - delta)),
+        #
+        # with the mirror image for delta < 0. Both one-sided limits are 0, not
+        # infinity: at n = 15 the statistic is -/+0.1225 at delta = +/-1e-3 and
+        # -/+3.873e-6 at delta = +/-1e-12. Returning 0 here is the continuous
+        # extension of Z across the hole, and it is the value the reduction gives
+        # in the limit from either side.
+        #
+        # At the boundary of the feasible range the numerator does not vanish,
+        # the observed difference is impossible under the constraint, and the
+        # statistic genuinely diverges.
         if numerator == 0.0:
             return 0.0
         return math.inf if numerator > 0.0 else -math.inf
@@ -416,3 +430,184 @@ def _constrained_mle_p21(paired: PairedResult, delta: float) -> float:
     lowest = max(0.0, -delta)
     highest = (1.0 - delta) / 2.0
     return min(max(root, lowest), highest)
+
+
+@dataclass(frozen=True, slots=True)
+class ComparisonResult:
+    """A complete paired comparison of two policies: estimate, interval, and test.
+
+    The estimand is ``delta = p_A - p_B``, the difference in true success rates.
+    A p-value never travels alone here: ``delta`` and ``interval`` are always
+    present alongside ``p_value``, because a significance verdict without an
+    effect size and its uncertainty is the failure mode this package exists to
+    prevent.
+
+    Parameters
+    ----------
+    delta : float
+        Point estimate of ``p_A - p_B``.
+    interval : ConfidenceInterval
+        Tango score interval for ``delta`` at ``confidence``.
+    p_value : float
+        Two-sided McNemar p-value for the null ``delta == 0``.
+    method : str
+        Which McNemar variant produced ``p_value``, ``"exact"`` or ``"chi2"``.
+    n_pairs : int
+        Number of matched scenarios.
+    n_discordant : int
+        Number of scenarios the two policies disagreed on.
+    n_both_success, n_a_success_b_failure, n_b_success_a_failure, n_both_failure : int
+        The four cells of the 2x2 table the comparison was computed from.
+    confidence : float
+        Nominal confidence level of ``interval``.
+    protocol_mismatch : bool
+        Whether this comparison crossed differing protocols. ``True`` only when
+        a mismatch was found and waived with ``allow_protocol_mismatch=True``,
+        so that a downstream report can state it. An override that leaves no
+        trace in the output is not an override, it is a silent defect.
+    protocol_fingerprints_a, protocol_fingerprints_b : tuple of str
+        The distinct protocol fingerprints found on each side, carried so a
+        report can name them without re-reading the records.
+    schema_version : int
+        The record schema version this comparison was computed under.
+    """
+
+    delta: float
+    interval: ConfidenceInterval
+    p_value: float
+    method: str
+    n_pairs: int
+    n_discordant: int
+    n_both_success: int
+    n_a_success_b_failure: int
+    n_b_success_a_failure: int
+    n_both_failure: int
+    confidence: float
+    protocol_mismatch: bool
+    protocol_fingerprints_a: tuple[str, ...]
+    protocol_fingerprints_b: tuple[str, ...]
+    schema_version: int = SCHEMA_VERSION
+
+
+def compare(
+    paired: PairedResult,
+    *,
+    confidence: float = 0.95,
+    method: str = "exact",
+    allow_protocol_mismatch: bool = False,
+) -> ComparisonResult:
+    """Compare two policies evaluated on the same scenarios.
+
+    The estimand is ``delta = p_A - p_B``, the difference in true success rates.
+    This is the primary entry point of the module: it estimates ``delta``, bounds
+    it with :func:`paired_difference`, and tests it with :func:`mcnemar`, and it
+    returns all three together. There is no way to obtain the p-value from it
+    without the effect size and interval that give the p-value its meaning.
+
+    Parameters
+    ----------
+    paired : PairedResult
+        The 2x2 table from :func:`~robostats.records.pair`.
+    confidence : float, default 0.95
+        Nominal two-sided confidence level for the interval, strictly inside
+        ``(0, 1)``.
+    method : {"exact", "chi2"}, default "exact"
+        Which McNemar variant computes the p-value. See :func:`mcnemar`; the
+        exact test is preferred at every sample size and there is no automatic
+        selection between the two.
+    allow_protocol_mismatch : bool, default False
+        Waive the protocol checks below. The mismatch is then recorded on the
+        result rather than suppressed.
+
+    Returns
+    -------
+    ComparisonResult
+        The estimate, its interval, the p-value, the counts they came from, and
+        whether the comparison crossed protocols.
+
+    Raises
+    ------
+    ValueError
+        If ``method`` is not ``"exact"`` or ``"chi2"``, or if ``confidence``
+        lies outside ``(0, 1)``. Both are caller errors and are checked before
+        the data.
+    ProtocolMismatchError
+        Unless ``allow_protocol_mismatch=True``, if the two sides carry
+        different protocol fingerprints, or if either side carries more than
+        one fingerprint internally. A side that mixed protocols cannot take part
+        in a sound comparison, whichever side it is compared against.
+
+    Notes
+    -----
+    Comparing runs collected under different protocols is the error this package
+    exists to catch, so the check is never waived by default and never waived
+    from the data.
+    """
+    if method not in METHODS:
+        raise ValueError(
+            f"method must be one of {', '.join(repr(name) for name in METHODS)}; "
+            f"got {method!r}. There is no automatic selection between them."
+        )
+    if not 0.0 < confidence < 1.0:
+        raise ValueError(f"confidence must lie strictly inside (0, 1), got {confidence!r}")
+
+    protocol_mismatch = _protocol_mismatch(paired)
+    if protocol_mismatch and not allow_protocol_mismatch:
+        raise ProtocolMismatchError(_protocol_mismatch_message(paired))
+
+    test = mcnemar(paired, method=method)
+    interval = paired_difference(paired, confidence=confidence)
+    return ComparisonResult(
+        delta=test.delta,
+        interval=interval,
+        p_value=test.p_value,
+        method=test.method,
+        n_pairs=paired.n_pairs,
+        n_discordant=paired.n_discordant,
+        n_both_success=paired.n_both_success,
+        n_a_success_b_failure=paired.n_a_success_b_failure,
+        n_b_success_a_failure=paired.n_b_success_a_failure,
+        n_both_failure=paired.n_both_failure,
+        confidence=confidence,
+        protocol_mismatch=protocol_mismatch,
+        protocol_fingerprints_a=paired.protocol_fingerprints_a,
+        protocol_fingerprints_b=paired.protocol_fingerprints_b,
+        schema_version=SCHEMA_VERSION,
+    )
+
+
+def _protocol_mismatch(paired: PairedResult) -> bool:
+    """Whether the two sides fail the protocol checks of :func:`compare`.
+
+    True if the two sides carry different sets of fingerprints, or if either
+    side carries more than one. A side that mixed protocols is not comparable to
+    anything, including a side that mixed them the same way, so the internal
+    check is not subsumed by the equality check.
+    """
+    fingerprints_a = paired.protocol_fingerprints_a
+    fingerprints_b = paired.protocol_fingerprints_b
+    if len(fingerprints_a) > 1 or len(fingerprints_b) > 1:
+        return True
+    return set(fingerprints_a) != set(fingerprints_b)
+
+
+def _protocol_mismatch_message(paired: PairedResult) -> str:
+    """Name the fingerprints found on each side, and which check they failed."""
+    fingerprints_a = paired.protocol_fingerprints_a
+    fingerprints_b = paired.protocol_fingerprints_b
+    reasons = []
+    for name, fingerprints in (("a", fingerprints_a), ("b", fingerprints_b)):
+        if len(fingerprints) > 1:
+            reasons.append(
+                f"side {name!r} mixes {len(fingerprints)} protocols internally, so no "
+                f"comparison involving it can be sound"
+            )
+    if set(fingerprints_a) != set(fingerprints_b):
+        reasons.append("the two sides were collected under different protocols")
+    return (
+        f"{'; '.join(reasons)}. "
+        f"Fingerprints on side 'a': {', '.join(repr(value) for value in fingerprints_a)}. "
+        f"Fingerprints on side 'b': {', '.join(repr(value) for value in fingerprints_b)}. "
+        f"Pass allow_protocol_mismatch=True to compare anyway; the result then records "
+        f"protocol_mismatch=True."
+    )

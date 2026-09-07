@@ -11,6 +11,7 @@ __all__ = [
     "EmptyRecordSetError",
     "MissingScenarioIdError",
     "MixedPolicyError",
+    "ProtocolMismatchError",
     "RobostatsError",
     "SchemaError",
 ]
@@ -38,3 +39,14 @@ class SchemaError(RobostatsError):
 
 class MixedPolicyError(RobostatsError):
     """A record set holds more than one ``policy_id`` where exactly one was required."""
+
+
+class ProtocolMismatchError(RobostatsError):
+    """Two sides of a comparison were collected under different protocols.
+
+    Raised when the protocol fingerprints of the two sides differ, or when one
+    side mixes protocols internally. Comparing runs collected under different
+    protocols is the error this package exists to catch, so it is never the
+    silent default; callers who mean it pass ``allow_protocol_mismatch=True``,
+    and the result then records that the comparison crossed protocols.
+    """

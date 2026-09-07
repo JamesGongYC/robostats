@@ -13,14 +13,17 @@ from scipy.optimize import minimize_scalar
 from statsmodels.stats.contingency_tables import mcnemar as statsmodels_mcnemar
 
 from robostats.compare import (
+    ComparisonResult,
     McNemarResult,
     _constrained_mle_p21,
     _tango_score,
+    compare,
     mcnemar,
     paired_difference,
 )
+from robostats.errors import ProtocolMismatchError, RobostatsError
 from robostats.intervals import ConfidenceInterval
-from robostats.records import PairedResult
+from robostats.records import SCHEMA_VERSION, EpisodeRecord, PairedResult, Protocol, RecordSet, pair
 
 #: 2x2 tables as (n_both_success, n_ab, n_ba, n_both_failure). The grid covers
 #: small discordant counts, m = 0, equal discordant cells, wholly one-sided
@@ -53,13 +56,18 @@ ORACLE_TOL = 1e-10
 
 
 def table(
-    n_both_success: int, n_ab: int, n_ba: int, n_both_failure: int
+    n_both_success: int,
+    n_ab: int,
+    n_ba: int,
+    n_both_failure: int,
+    *,
+    fingerprints_a: tuple[str, ...] = ("fingerprint",),
+    fingerprints_b: tuple[str, ...] = ("fingerprint",),
 ) -> PairedResult:
     """Build a :class:`PairedResult` holding these four counts.
 
-    The scenario ids are synthetic and the protocol fingerprints match on both
-    sides: this module's tests are about the counts, and nothing here exercises
-    the protocol checks, which belong to ``compare()``.
+    The scenario ids are synthetic, and the protocol fingerprints match on both
+    sides unless a test overrides them: only ``compare()`` reads them.
     """
     n_pairs = n_both_success + n_ab + n_ba + n_both_failure
     return PairedResult(
@@ -70,8 +78,8 @@ def table(
         scenario_ids=tuple(f"scenario_{index:04d}" for index in range(n_pairs)),
         dropped_from_a=0,
         dropped_from_b=0,
-        protocol_fingerprints_a=("fingerprint",),
-        protocol_fingerprints_b=("fingerprint",),
+        protocol_fingerprints_a=fingerprints_a,
+        protocol_fingerprints_b=fingerprints_b,
         replicates="strict",
     )
 
@@ -503,9 +511,43 @@ def test_interval_records_its_method_and_confidence() -> None:
 
 def test_interval_result_type_is_reused_from_intervals() -> None:
     # The fields of ConfidenceInterval fit: point, lower, upper, confidence,
-    # method. Its docstring describes a proportion in [0, 1] and the bounds here
-    # lie in [-1, 1]; see the note in paired_difference's Returns section.
+    # method. Its docstring covers both ranges, [0, 1] for a proportion and
+    # [-1, 1] for this paired difference.
     assert isinstance(paired_difference(table(10, 3, 1, 6)), ConfidenceInterval)
+
+
+@pytest.mark.parametrize("n_pairs", [1, 15, 50, 500])
+@pytest.mark.parametrize("confidence", [0.90, 0.95, 0.99])
+def test_zero_discordant_interval_matches_its_closed_form(
+    n_pairs: int, confidence: float
+) -> None:
+    # Analytic anchor for the m = 0 branch only. It says nothing about any table
+    # with discordant pairs, where no closed form is available and the endpoints
+    # are found by root-finding.
+    #
+    # Derived here from the statistic, not from compare.py. With n_ab = n_ba = 0
+    # the constrained MLE of p21 is max(0, -delta), so for delta > 0 the variance
+    # is n * delta * (1 - delta), the numerator is -n * delta, and
+    #
+    #     Z(delta) = -sqrt(n * delta / (1 - delta)).
+    #
+    # Setting |Z| = z and solving, n * delta = z**2 * (1 - delta), so the
+    # endpoints are exactly +/- z**2 / (n + z**2), symmetric about zero. At
+    # n = 15 and 95% that is +/-0.2038833010358486.
+    z = stats.norm.ppf(0.5 + confidence / 2.0)
+    endpoint = z**2 / (n_pairs + z**2)
+
+    interval = paired_difference(table(n_pairs, 0, 0, 0), confidence=confidence)
+    assert interval.point == 0.0
+    assert interval.upper == pytest.approx(endpoint, abs=1e-15)
+    assert interval.lower == pytest.approx(-endpoint, abs=1e-15)
+
+
+def test_zero_discordant_anchor_at_the_documented_value() -> None:
+    # The n = 15, 95% case written out, as a guard on the closed form above.
+    interval = paired_difference(table(10, 0, 0, 5))
+    assert interval.upper == pytest.approx(0.2038833010358486, abs=1e-15)
+    assert interval.lower == pytest.approx(-0.2038833010358486, abs=1e-15)
 
 
 def test_default_confidence_is_ninety_five_percent() -> None:
@@ -528,3 +570,213 @@ def test_paired_difference_does_not_mutate_its_input() -> None:
 def test_confidence_is_keyword_only() -> None:
     with pytest.raises(TypeError):
         paired_difference(table(10, 3, 1, 6), 0.99)  # type: ignore[misc]
+
+
+# --------------------------------------------------------------------------------------
+# compare(): composition, and the protocol boundary
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("counts", TABLES, ids=str)
+@pytest.mark.parametrize("method", ["exact", "chi2"])
+def test_compare_composes_the_two_parts_without_altering_them(
+    counts: tuple[int, int, int, int], method: str
+) -> None:
+    paired = table(*counts)
+    result = compare(paired, method=method, confidence=0.9)
+    test = mcnemar(paired, method=method)
+    interval = paired_difference(paired, confidence=0.9)
+
+    assert result.delta == test.delta
+    assert result.p_value == test.p_value
+    assert result.method == test.method
+    assert result.interval == interval
+    assert result.confidence == 0.9
+
+
+@pytest.mark.parametrize("counts", TABLES, ids=str)
+def test_compare_carries_the_table_it_was_computed_from(
+    counts: tuple[int, int, int, int]
+) -> None:
+    n_both_success, n_ab, n_ba, n_both_failure = counts
+    result = compare(table(*counts))
+    assert result.n_both_success == n_both_success
+    assert result.n_a_success_b_failure == n_ab
+    assert result.n_b_success_a_failure == n_ba
+    assert result.n_both_failure == n_both_failure
+    assert result.n_pairs == sum(counts)
+    assert result.n_discordant == n_ab + n_ba
+    assert result.schema_version == SCHEMA_VERSION
+
+
+@pytest.mark.parametrize("counts", TABLES, ids=str)
+def test_compare_never_yields_a_p_value_without_an_estimate(
+    counts: tuple[int, int, int, int]
+) -> None:
+    # Decision 4, as a property rather than a code-shape assertion: every field
+    # needed to read the p-value in context is present and consistent with it.
+    result = compare(table(*counts))
+    assert result.interval.point == result.delta
+    assert result.interval.lower <= result.delta <= result.interval.upper
+    assert -1.0 <= result.interval.lower <= result.interval.upper <= 1.0
+
+
+def test_compare_accepts_matching_protocols_and_records_no_mismatch() -> None:
+    result = compare(table(10, 3, 1, 6, fingerprints_a=("abc",), fingerprints_b=("abc",)))
+    assert result.protocol_mismatch is False
+    assert result.protocol_fingerprints_a == ("abc",)
+    assert result.protocol_fingerprints_b == ("abc",)
+
+
+def test_compare_rejects_differing_fingerprints_and_names_them() -> None:
+    paired = table(10, 3, 1, 6, fingerprints_a=("aaa",), fingerprints_b=("bbb",))
+    with pytest.raises(ProtocolMismatchError) as caught:
+        compare(paired)
+    message = str(caught.value)
+    assert "different protocols" in message
+    assert "'aaa'" in message
+    assert "'bbb'" in message
+    assert "allow_protocol_mismatch=True" in message
+
+
+@pytest.mark.parametrize("mixed_side", ["a", "b"])
+def test_compare_rejects_a_side_that_mixes_protocols_internally(mixed_side: str) -> None:
+    mixed = ("aaa", "bbb")
+    single = ("aaa",)
+    paired = table(
+        10,
+        3,
+        1,
+        6,
+        fingerprints_a=mixed if mixed_side == "a" else single,
+        fingerprints_b=mixed if mixed_side == "b" else single,
+    )
+    with pytest.raises(ProtocolMismatchError, match="mixes 2 protocols internally"):
+        compare(paired)
+
+
+def test_compare_rejects_two_sides_that_mix_protocols_identically() -> None:
+    # The fingerprint sets are equal here, so the equality check alone would pass
+    # this. A side that mixed protocols is not comparable to anything, including
+    # a side that mixed them the same way: within each side the episodes are no
+    # longer a sample under one protocol.
+    paired = table(10, 3, 1, 6, fingerprints_a=("aaa", "bbb"), fingerprints_b=("aaa", "bbb"))
+    with pytest.raises(ProtocolMismatchError, match="mixes 2 protocols internally"):
+        compare(paired)
+
+
+@pytest.mark.parametrize(
+    ("fingerprints_a", "fingerprints_b"),
+    [
+        (("aaa",), ("bbb",)),
+        (("aaa", "bbb"), ("aaa",)),
+        (("aaa",), ("aaa", "bbb")),
+        (("aaa", "bbb"), ("aaa", "bbb")),
+    ],
+)
+def test_override_waives_the_check_and_leaves_a_trace(
+    fingerprints_a: tuple[str, ...], fingerprints_b: tuple[str, ...]
+) -> None:
+    paired = table(10, 3, 1, 6, fingerprints_a=fingerprints_a, fingerprints_b=fingerprints_b)
+    result = compare(paired, allow_protocol_mismatch=True)
+    assert result.protocol_mismatch is True
+    assert result.protocol_fingerprints_a == fingerprints_a
+    assert result.protocol_fingerprints_b == fingerprints_b
+    # The comparison itself is unaffected by the waiver.
+    assert result.p_value == mcnemar(paired).p_value
+    assert result.delta == mcnemar(paired).delta
+
+
+def test_override_does_not_invent_a_mismatch_when_there_is_none() -> None:
+    result = compare(table(10, 3, 1, 6), allow_protocol_mismatch=True)
+    assert result.protocol_mismatch is False
+
+
+def test_protocol_mismatch_is_a_robostats_error() -> None:
+    with pytest.raises(RobostatsError):
+        compare(table(10, 3, 1, 6, fingerprints_a=("aaa",), fingerprints_b=("bbb",)))
+
+
+def test_compare_end_to_end_from_records() -> None:
+    # The real path: two runs under different protocols, joined by pair(), then
+    # compared. Nothing between the records and compare() reconciles them.
+    fast = Protocol(execution_horizon=8, reset_mode="fixed", max_steps=300)
+    slow = Protocol(execution_horizon=1, reset_mode="fixed", max_steps=300)
+    scenarios = [f"suite/task_00/init_{index:02d}" for index in range(6)]
+    outcomes_a = [True, True, True, False, True, False]
+    outcomes_b = [True, False, True, False, False, False]
+
+    def build(policy: str, outcomes: list[bool], protocol: Protocol) -> RecordSet:
+        return RecordSet(
+            EpisodeRecord(
+                policy_id=policy,
+                task_id="task_00",
+                success=success,
+                scenario_id=scenario,
+                protocol=protocol,
+            )
+            for scenario, success in zip(scenarios, outcomes, strict=True)
+        )
+
+    matched = pair(build("a", outcomes_a, fast), build("b", outcomes_b, fast))
+    result = compare(matched)
+    assert result.protocol_mismatch is False
+    assert result.n_pairs == 6
+    assert result.n_a_success_b_failure == 2
+    assert result.n_b_success_a_failure == 0
+    assert result.delta == pytest.approx(2 / 6)
+
+    crossed = pair(build("a", outcomes_a, fast), build("b", outcomes_b, slow))
+    with pytest.raises(ProtocolMismatchError):
+        compare(crossed)
+    assert compare(crossed, allow_protocol_mismatch=True).protocol_mismatch is True
+
+
+def test_compare_at_zero_discordant_pairs() -> None:
+    result = compare(table(10, 0, 0, 5))
+    assert result.p_value == 1.0
+    assert result.delta == 0.0
+    assert result.n_discordant == 0
+    assert result.interval.lower < 0.0 < result.interval.upper
+
+
+@pytest.mark.parametrize("method", ["", "auto", "chisq", None])
+def test_compare_rejects_an_unknown_method(method: object) -> None:
+    with pytest.raises(ValueError, match="method must be one of"):
+        compare(table(10, 3, 1, 6), method=method)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("confidence", [0.0, 1.0, -0.1, 1.5])
+def test_compare_rejects_confidence_outside_the_open_unit_interval(confidence: float) -> None:
+    with pytest.raises(ValueError, match="confidence"):
+        compare(table(10, 3, 1, 6), confidence=confidence)
+
+
+def test_caller_errors_are_reported_before_the_protocol_check() -> None:
+    # A bad argument is the caller's mistake and is cheap to detect; the protocol
+    # check is about the data. Both are wrong here, and the argument wins.
+    paired = table(10, 3, 1, 6, fingerprints_a=("aaa",), fingerprints_b=("bbb",))
+    with pytest.raises(ValueError, match="method must be one of"):
+        compare(paired, method="auto")
+
+
+def test_compare_result_is_frozen() -> None:
+    result = compare(table(10, 3, 1, 6))
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.p_value = 0.0  # type: ignore[misc]
+
+
+def test_compare_does_not_mutate_its_input() -> None:
+    paired = table(10, 3, 1, 6)
+    before = dataclasses.astuple(paired)
+    compare(paired)
+    assert dataclasses.astuple(paired) == before
+
+
+def test_compare_arguments_are_keyword_only() -> None:
+    with pytest.raises(TypeError):
+        compare(table(10, 3, 1, 6), 0.99)  # type: ignore[misc]
+
+
+def test_compare_returns_the_declared_result_type() -> None:
+    assert isinstance(compare(table(10, 3, 1, 6)), ComparisonResult)

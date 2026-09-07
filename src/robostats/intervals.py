@@ -27,16 +27,23 @@ __all__ = [
 
 @dataclass(frozen=True, slots=True)
 class ConfidenceInterval:
-    """A two-sided confidence interval for a binomial proportion.
+    """A two-sided confidence interval for an estimand this package estimates.
+
+    The estimand is whatever the constructing function documents, and the range
+    of the bounds follows from it: for the binomial proportion methods in this
+    module they lie in ``[0, 1]``, while for the paired difference in success
+    rates estimated by :func:`robostats.compare.paired_difference` they lie in
+    ``[-1, 1]``.
 
     Parameters
     ----------
     point : float
-        The sample proportion ``successes / n``.
+        The point estimate the interval surrounds. The sample proportion
+        ``successes / n`` for the methods in this module.
     lower : float
-        Lower bound, in ``[0, 1]``.
+        Lower bound, inside the range of the estimand.
     upper : float
-        Upper bound, in ``[0, 1]``.
+        Upper bound, inside the range of the estimand.
     confidence : float
         The nominal confidence level the interval was constructed at.
     method : str
