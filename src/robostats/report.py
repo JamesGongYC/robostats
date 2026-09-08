@@ -5,15 +5,19 @@ where its output belongs: that is the caller's decision. There is no colour, no
 terminal-width detection, and no dependency. Calling it twice on the same result
 returns the same string.
 
-The report always states the protocol status, in all three of its states. A
-report that omits the protocol line when everything matched would train its
-readers not to look for it, and the one time it matters is the time it is absent.
+The report always states what each side declared as its protocol, including when
+a side declared nothing, which renders as ``(not recorded)``. It never comments
+on whether the comparison is sound: the package does not adjudicate that. A line
+that appeared only on trouble would train readers to stop looking for it, and a
+visible blank makes the case for recording these fields better than an exception
+does.
 """
 
 from __future__ import annotations
 
 from robostats.compare import ComparisonResult, McNemarResult
 from robostats.intervals import ConfidenceInterval
+from robostats.records import Protocol
 
 __all__ = ["report"]
 
@@ -93,19 +97,36 @@ def format_confidence(confidence: float) -> str:
     return f"{percentage:g}%"
 
 
-def _protocol_line(result: ComparisonResult) -> str:
-    """Describe the protocol status, which is never omitted."""
-    if result.protocol_unspecified:
-        return (
-            "Protocol:      unspecified (compared anyway): neither side recorded a "
-            "protocol, so the check compared nothing"
-        )
-    if result.protocol_mismatch:
-        return (
-            "Protocol:      MISMATCHED (compared anyway): the two sides were not "
-            "collected under the same protocol"
-        )
-    return "Protocol:      matched"
+#: Fingerprint of a protocol with nothing declared. A side carrying it recorded
+#: no protocol, which the report shows rather than hides.
+_NOT_RECORDED = Protocol().fingerprint()
+
+#: Width of the label column, so continuation lines align under the first.
+_LABEL_WIDTH = 15
+
+
+def _describe_protocol(fingerprints: tuple[str, ...]) -> str:
+    """Say what one side declared, from the fingerprints the result carries."""
+    if not fingerprints or fingerprints == (_NOT_RECORDED,):
+        return "(not recorded)"
+    if len(fingerprints) == 1:
+        return f"protocol {fingerprints[0][:12]}"
+    listed = ", ".join(fingerprint[:12] for fingerprint in fingerprints)
+    return f"{len(fingerprints)} protocols: {listed}"
+
+
+def _protocol_lines(result: ComparisonResult) -> list[str]:
+    """One line per side, always present, stating what that side declared."""
+    sides = (
+        (result.policy_id_a, result.protocol_fingerprints_a),
+        (result.policy_id_b, result.protocol_fingerprints_b),
+    )
+    name_width = max(len(policy) for policy, _ in sides)
+    return [
+        f"{'Protocol:' if index == 0 else '':<{_LABEL_WIDTH}}"
+        f"{policy:<{name_width}}  {_describe_protocol(fingerprints)}"
+        for index, (policy, fingerprints) in enumerate(sides)
+    ]
 
 
 def _comparison_report(result: ComparisonResult) -> str:
@@ -131,7 +152,7 @@ def _comparison_report(result: ComparisonResult) -> str:
             f"Dropped:       {result.dropped_from_a} from {result.policy_id_a}, "
             f"{result.dropped_from_b} from {result.policy_id_b}"
         ),
-        _protocol_line(result),
+        *_protocol_lines(result),
     ]
     return "\n".join(lines)
 

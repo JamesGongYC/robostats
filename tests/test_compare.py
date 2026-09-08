@@ -16,21 +16,14 @@ from robostats.compare import (
     ComparisonResult,
     McNemarResult,
     _constrained_mle_p21,
-    _protocol_mismatch,
     _tango_score,
     compare,
     mcnemar,
     paired_difference,
 )
-from robostats.errors import (
-    ProtocolMismatchError,
-    RobostatsError,
-    UnspecifiedProtocolError,
-)
 from robostats.intervals import ConfidenceInterval
 from robostats.records import (
     SCHEMA_VERSION,
-    UNSPECIFIED_PROTOCOL_FINGERPRINT,
     EpisodeRecord,
     PairedResult,
     Protocol,
@@ -707,19 +700,24 @@ def test_compare_accepts_matching_protocols_and_records_no_mismatch() -> None:
     assert result.protocol_fingerprints_b == ("abc",)
 
 
-def test_compare_rejects_differing_fingerprints_and_names_them() -> None:
+def test_differing_fingerprints_compare_and_are_recorded() -> None:
+    # Decision 2: a differing protocol is described, not refused. An execution
+    # horizon is a deployment choice, and two policies with different natural
+    # chunk sizes are a legitimate comparison.
     paired = table(10, 3, 1, 6, fingerprints_a=("aaa",), fingerprints_b=("bbb",))
-    with pytest.raises(ProtocolMismatchError) as caught:
-        compare(paired)
-    message = str(caught.value)
-    assert "different protocols" in message
-    assert "'aaa'" in message
-    assert "'bbb'" in message
-    assert "allow_protocol_mismatch=True" in message
+    result = compare(paired)
+    assert result.protocol_mismatch is True
+    assert result.protocol_fingerprints_a == ("aaa",)
+    assert result.protocol_fingerprints_b == ("bbb",)
+    assert result.p_value == mcnemar(paired).p_value
 
 
 @pytest.mark.parametrize("mixed_side", ["a", "b"])
-def test_compare_rejects_a_side_that_mixes_protocols_internally(mixed_side: str) -> None:
+def test_a_side_that_mixes_protocols_compares_and_the_mixing_stays_visible(
+    mixed_side: str,
+) -> None:
+    # Decision 6: a side that mixed protocols is reported, not adjudicated. The
+    # multi-element tuple is the report.
     mixed = ("aaa", "bbb")
     single = ("aaa",)
     paired = table(
@@ -730,50 +728,66 @@ def test_compare_rejects_a_side_that_mixes_protocols_internally(mixed_side: str)
         fingerprints_a=mixed if mixed_side == "a" else single,
         fingerprints_b=mixed if mixed_side == "b" else single,
     )
-    with pytest.raises(ProtocolMismatchError, match="mixes 2 protocols internally"):
-        compare(paired)
+    result = compare(paired)
+    fingerprints = (
+        result.protocol_fingerprints_a if mixed_side == "a" else result.protocol_fingerprints_b
+    )
+    assert fingerprints == mixed
+    assert result.protocol_mismatch is True
 
 
-def test_compare_rejects_two_sides_that_mix_protocols_identically() -> None:
-    # The fingerprint sets are equal here, so the equality check alone would pass
-    # this. A side that mixed protocols is not comparable to anything, including
-    # a side that mixed them the same way: within each side the episodes are no
-    # longer a sample under one protocol.
+def test_two_sides_that_mix_protocols_identically_compare_and_declare_the_same_thing() -> None:
+    # Decisions 2 and 6. The sets are equal, so the two sides declared the same
+    # thing as each other and protocol_mismatch is False; that each side mixed
+    # two protocols is visible in the tuples rather than folded into the flag.
     paired = table(10, 3, 1, 6, fingerprints_a=("aaa", "bbb"), fingerprints_b=("aaa", "bbb"))
-    with pytest.raises(ProtocolMismatchError, match="mixes 2 protocols internally"):
-        compare(paired)
+    result = compare(paired)
+    assert result.protocol_mismatch is False
+    assert result.protocol_fingerprints_a == ("aaa", "bbb")
+    assert result.protocol_fingerprints_b == ("aaa", "bbb")
 
 
-@pytest.mark.parametrize(
-    ("fingerprints_a", "fingerprints_b"),
-    [
+def test_both_sides_unspecified_compare_and_are_not_a_mismatch() -> None:
+    # Decision 3: unspecified is now simply a protocol with nothing declared.
+    # Two of them fingerprint alike, so they do not differ from each other.
+    unspecified = (Protocol().fingerprint(),)
+    result = compare(table(10, 3, 1, 6, fingerprints_a=unspecified, fingerprints_b=unspecified))
+    assert result.protocol_mismatch is False
+    assert result.protocol_fingerprints_a == unspecified
+
+
+def test_one_side_unspecified_is_a_difference_and_still_compares() -> None:
+    # Decision 2: the fingerprints do differ, so the flag is true, and nothing
+    # blocks.
+    unspecified = (Protocol().fingerprint(),)
+    specified = (Protocol(execution_horizon=8).fingerprint(),)
+    result = compare(table(10, 3, 1, 6, fingerprints_a=unspecified, fingerprints_b=specified))
+    assert result.protocol_mismatch is True
+
+
+def test_allow_protocol_mismatch_is_gone_rather_than_ignored() -> None:
+    # Decision 4: a flag that waives a check that no longer exists implies a
+    # guarantee the package does not provide, so it is removed, not accepted
+    # and ignored.
+    with pytest.raises(TypeError):
+        compare(table(10, 3, 1, 6), allow_protocol_mismatch=True)  # type: ignore[call-arg]
+
+
+def test_nothing_in_compare_raises_on_a_protocol() -> None:
+    # Decision 1: scenario identity is the only thing that blocks, and pair()
+    # enforces that. Every protocol shape reaches a result.
+    unspecified = (Protocol().fingerprint(),)
+    for fingerprints_a, fingerprints_b in (
         (("aaa",), ("bbb",)),
         (("aaa", "bbb"), ("aaa",)),
-        (("aaa",), ("aaa", "bbb")),
-        (("aaa", "bbb"), ("aaa", "bbb")),
-    ],
-)
-def test_override_waives_the_check_and_leaves_a_trace(
-    fingerprints_a: tuple[str, ...], fingerprints_b: tuple[str, ...]
-) -> None:
-    paired = table(10, 3, 1, 6, fingerprints_a=fingerprints_a, fingerprints_b=fingerprints_b)
-    result = compare(paired, allow_protocol_mismatch=True)
-    assert result.protocol_mismatch is True
-    assert result.protocol_fingerprints_a == fingerprints_a
-    assert result.protocol_fingerprints_b == fingerprints_b
-    # The comparison itself is unaffected by the waiver.
-    assert result.p_value == mcnemar(paired).p_value
-    assert result.delta == mcnemar(paired).delta
-
-
-def test_override_does_not_invent_a_mismatch_when_there_is_none() -> None:
-    result = compare(table(10, 3, 1, 6), allow_protocol_mismatch=True)
-    assert result.protocol_mismatch is False
-
-
-def test_protocol_mismatch_is_a_robostats_error() -> None:
-    with pytest.raises(RobostatsError):
-        compare(table(10, 3, 1, 6, fingerprints_a=("aaa",), fingerprints_b=("bbb",)))
+        (unspecified, unspecified),
+        (unspecified, ("aaa",)),
+        ((), ()),
+    ):
+        result = compare(
+            table(10, 3, 1, 6, fingerprints_a=fingerprints_a, fingerprints_b=fingerprints_b)
+        )
+        assert isinstance(result.protocol_mismatch, bool)
 
 
 def test_compare_end_to_end_from_records() -> None:
@@ -806,9 +820,11 @@ def test_compare_end_to_end_from_records() -> None:
     assert result.delta == pytest.approx(2 / 6)
 
     crossed = pair(build("a", outcomes_a, fast), build("b", outcomes_b, slow))
-    with pytest.raises(ProtocolMismatchError):
-        compare(crossed)
-    assert compare(crossed, allow_protocol_mismatch=True).protocol_mismatch is True
+    crossed_result = compare(crossed)
+    assert crossed_result.protocol_mismatch is True
+    assert crossed_result.protocol_fingerprints_a == (fast.fingerprint(),)
+    assert crossed_result.protocol_fingerprints_b == (slow.fingerprint(),)
+    assert crossed_result.p_value == mcnemar(crossed).p_value
 
 
 def test_compare_at_zero_discordant_pairs() -> None:
@@ -831,14 +847,6 @@ def test_compare_rejects_confidence_outside_the_open_unit_interval(confidence: f
         compare(table(10, 3, 1, 6), confidence=confidence)
 
 
-def test_caller_errors_are_reported_before_the_protocol_check() -> None:
-    # A bad argument is the caller's mistake and is cheap to detect; the protocol
-    # check is about the data. Both are wrong here, and the argument wins.
-    paired = table(10, 3, 1, 6, fingerprints_a=("aaa",), fingerprints_b=("bbb",))
-    with pytest.raises(ValueError, match="method must be one of"):
-        compare(paired, method="auto")
-
-
 def test_compare_result_is_frozen() -> None:
     result = compare(table(10, 3, 1, 6))
     with pytest.raises(dataclasses.FrozenInstanceError):
@@ -859,118 +867,6 @@ def test_compare_arguments_are_keyword_only() -> None:
 
 def test_compare_returns_the_declared_result_type() -> None:
     assert isinstance(compare(table(10, 3, 1, 6)), ComparisonResult)
-
-
-# --------------------------------------------------------------------------------------
-# Unspecified is not the same as matching
-# --------------------------------------------------------------------------------------
-
-UNSPECIFIED = (UNSPECIFIED_PROTOCOL_FINGERPRINT,)
-SPECIFIED = (Protocol(execution_horizon=8, reset_mode="fixed", max_steps=300).fingerprint(),)
-
-
-def test_a_protocol_with_nothing_recorded_is_unspecified() -> None:
-    assert Protocol().is_unspecified is True
-    assert Protocol(extra={}).is_unspecified is True
-    assert Protocol(execution_horizon=8).is_unspecified is False
-    assert Protocol(reset_mode="fixed").is_unspecified is False
-    assert Protocol(max_steps=300).is_unspecified is False
-    assert Protocol(extra={"suite": "libero"}).is_unspecified is False
-
-
-def test_the_unspecified_fingerprint_constant_is_that_protocols_fingerprint() -> None:
-    # Exact: a fingerprint is a hex digest, so equality is equality. compare()
-    # only ever sees fingerprints, so it recognises the case through this.
-    assert UNSPECIFIED_PROTOCOL_FINGERPRINT == Protocol().fingerprint()
-
-
-def test_two_unspecified_protocols_fingerprint_identically() -> None:
-    # This is the hole decision 5 closes: the fingerprint check passes here
-    # while knowing nothing, which is the one case where a passing check means
-    # least.
-    assert Protocol().fingerprint() == Protocol().fingerprint()
-    assert not _protocol_mismatch(
-        table(10, 3, 1, 6, fingerprints_a=UNSPECIFIED, fingerprints_b=UNSPECIFIED)
-    )
-
-
-def test_both_sides_unspecified_raises() -> None:
-    paired = table(10, 3, 1, 6, fingerprints_a=UNSPECIFIED, fingerprints_b=UNSPECIFIED)
-    with pytest.raises(UnspecifiedProtocolError) as caught:
-        compare(paired)
-    message = str(caught.value)
-    assert "recorded no protocol at all" in message
-    assert "allow_protocol_mismatch=True" in message
-
-
-def test_both_sides_unspecified_is_a_robostats_error() -> None:
-    with pytest.raises(RobostatsError):
-        compare(table(10, 3, 1, 6, fingerprints_a=UNSPECIFIED, fingerprints_b=UNSPECIFIED))
-
-
-def test_the_override_records_that_the_protocol_was_unspecified() -> None:
-    paired = table(10, 3, 1, 6, fingerprints_a=UNSPECIFIED, fingerprints_b=UNSPECIFIED)
-    result = compare(paired, allow_protocol_mismatch=True)
-    assert result.protocol_unspecified is True
-    # Not a mismatch: the two agree, on nothing. The two flags mean different
-    # things and are never collapsed into one.
-    assert result.protocol_mismatch is False
-    assert result.p_value == mcnemar(paired).p_value
-
-
-@pytest.mark.parametrize(
-    ("fingerprints_a", "fingerprints_b"),
-    [(UNSPECIFIED, SPECIFIED), (SPECIFIED, UNSPECIFIED)],
-)
-def test_one_side_unspecified_is_a_mismatch_not_an_unspecified_comparison(
-    fingerprints_a: tuple[str, ...], fingerprints_b: tuple[str, ...]
-) -> None:
-    paired = table(10, 3, 1, 6, fingerprints_a=fingerprints_a, fingerprints_b=fingerprints_b)
-    with pytest.raises(ProtocolMismatchError):
-        compare(paired)
-    result = compare(paired, allow_protocol_mismatch=True)
-    assert result.protocol_mismatch is True
-    assert result.protocol_unspecified is False
-
-
-def test_matching_specified_protocols_pass_silently_with_both_flags_false() -> None:
-    result = compare(table(10, 3, 1, 6, fingerprints_a=SPECIFIED, fingerprints_b=SPECIFIED))
-    assert result.protocol_mismatch is False
-    assert result.protocol_unspecified is False
-
-
-def test_unspecified_protocols_raise_end_to_end_from_records() -> None:
-    # The path a user actually takes: records loaded without a protocol, paired,
-    # then compared. Nothing in between notices, which is the point.
-    scenarios = [f"suite/task_00/init_{index:02d}" for index in range(6)]
-    outcomes_a = [True, True, True, False, True, False]
-    outcomes_b = [True, False, True, False, False, False]
-
-    def build(policy: str, outcomes: list[bool]) -> RecordSet:
-        return RecordSet(
-            EpisodeRecord(
-                policy_id=policy,
-                task_id="task_00",
-                success=success,
-                scenario_id=scenario,
-                protocol=Protocol(),
-            )
-            for scenario, success in zip(scenarios, outcomes, strict=True)
-        )
-
-    matched = pair(build("a", outcomes_a), build("b", outcomes_b))
-    assert matched.protocol_fingerprints_a == UNSPECIFIED
-    with pytest.raises(UnspecifiedProtocolError):
-        compare(matched)
-    assert compare(matched, allow_protocol_mismatch=True).protocol_unspecified is True
-
-
-def test_a_mixed_side_is_reported_as_a_mismatch_even_when_one_protocol_is_unspecified() -> None:
-    paired = table(
-        10, 3, 1, 6, fingerprints_a=UNSPECIFIED + SPECIFIED, fingerprints_b=UNSPECIFIED
-    )
-    with pytest.raises(ProtocolMismatchError, match="mixes 2 protocols internally"):
-        compare(paired)
 
 
 @pytest.mark.parametrize("counts", TABLES, ids=str)

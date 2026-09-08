@@ -10,12 +10,12 @@ import pytest
 import robostats
 from robostats.compare import compare, mcnemar, paired_difference
 from robostats.intervals import wilson
-from robostats.records import UNSPECIFIED_PROTOCOL_FINGERPRINT, PairedResult, Protocol
+from robostats.records import PairedResult, Protocol
 from robostats.report import format_p_value, format_proportion, report
 
 SPECIFIED = (Protocol(execution_horizon=8, reset_mode="fixed", max_steps=300).fingerprint(),)
 OTHER = (Protocol(execution_horizon=1).fingerprint(),)
-UNSPECIFIED = (UNSPECIFIED_PROTOCOL_FINGERPRINT,)
+UNSPECIFIED = (Protocol().fingerprint(),)
 
 
 def table(
@@ -109,38 +109,76 @@ def test_dropped_counts_are_reported_when_nonzero() -> None:
 # --------------------------------------------------------------------------------------
 
 
-def test_protocol_line_says_matched() -> None:
-    rendered = report(compare(table(10, 3, 1, 6)))
-    assert "Protocol:" in rendered
-    assert "matched" in rendered
+def protocol_block(rendered: str) -> list[str]:
+    """The protocol line and the continuation lines indented under it."""
+    lines = rendered.splitlines()
+    start = next(index for index, line in enumerate(lines) if line.startswith("Protocol:"))
+    block = [lines[start]]
+    for line in lines[start + 1 :]:
+        if not line.startswith(" "):
+            break
+        block.append(line)
+    return block
+
+
+def test_protocol_is_reported_per_side_when_both_declared_the_same_thing() -> None:
+    block = protocol_block(report(compare(table(10, 3, 1, 6))))
+    assert len(block) == 2
+    assert "pi_zero" in block[0]
+    assert "octo" in block[1]
+    assert SPECIFIED[0][:12] in block[0]
+    assert SPECIFIED[0][:12] in block[1]
+
+
+def test_protocol_is_reported_per_side_when_the_two_differ() -> None:
+    # Decision 7: the report states what each side declared. It does not say
+    # whether the comparison is sound.
+    rendered = report(compare(table(10, 3, 1, 6, fingerprints_a=SPECIFIED, fingerprints_b=OTHER)))
+    block = protocol_block(rendered)
+    assert SPECIFIED[0][:12] in block[0]
+    assert OTHER[0][:12] in block[1]
     assert "MISMATCHED" not in rendered
-    assert "unspecified" not in rendered
+    assert "compared anyway" not in rendered
 
 
-def test_protocol_line_says_mismatched_under_the_override() -> None:
-    paired = table(10, 3, 1, 6, fingerprints_a=SPECIFIED, fingerprints_b=OTHER)
-    rendered = report(compare(paired, allow_protocol_mismatch=True))
-    assert "MISMATCHED" in rendered
-    assert "compared anyway" in rendered
+def test_a_side_that_declared_nothing_renders_as_not_recorded() -> None:
+    block = protocol_block(
+        report(compare(table(10, 3, 1, 6, fingerprints_a=UNSPECIFIED, fingerprints_b=UNSPECIFIED)))
+    )
+    assert len(block) == 2
+    assert all("(not recorded)" in line for line in block)
 
 
-def test_protocol_line_says_unspecified_under_the_override() -> None:
-    paired = table(10, 3, 1, 6, fingerprints_a=UNSPECIFIED, fingerprints_b=UNSPECIFIED)
-    rendered = report(compare(paired, allow_protocol_mismatch=True))
-    assert "unspecified" in rendered
-    assert "compared anyway" in rendered
-    assert "MISMATCHED" not in rendered
+def test_one_side_recorded_and_one_not() -> None:
+    block = protocol_block(
+        report(compare(table(10, 3, 1, 6, fingerprints_a=UNSPECIFIED, fingerprints_b=SPECIFIED)))
+    )
+    assert "(not recorded)" in block[0]
+    assert SPECIFIED[0][:12] in block[1]
 
 
-def test_the_protocol_line_is_never_omitted() -> None:
-    # Omitting it in the ordinary case teaches readers not to look for it.
-    for paired, override in (
-        (table(10, 3, 1, 6), False),
-        (table(10, 3, 1, 6, fingerprints_b=OTHER), True),
-        (table(10, 3, 1, 6, fingerprints_a=UNSPECIFIED, fingerprints_b=UNSPECIFIED), True),
+def test_a_side_that_mixed_protocols_says_so() -> None:
+    mixed = SPECIFIED + OTHER
+    block = protocol_block(
+        report(compare(table(10, 3, 1, 6, fingerprints_a=mixed, fingerprints_b=SPECIFIED)))
+    )
+    assert "2 protocols" in block[0]
+    assert SPECIFIED[0][:12] in block[0]
+    assert OTHER[0][:12] in block[0]
+
+
+def test_the_protocol_block_is_never_omitted() -> None:
+    # Decision 7. A line that appears only on trouble trains readers to stop
+    # looking for it, and a visible blank argues for recording the fields.
+    for paired in (
+        table(10, 3, 1, 6),
+        table(10, 3, 1, 6, fingerprints_b=OTHER),
+        table(10, 3, 1, 6, fingerprints_a=UNSPECIFIED, fingerprints_b=UNSPECIFIED),
+        table(10, 3, 1, 6, fingerprints_a=SPECIFIED + OTHER, fingerprints_b=SPECIFIED),
     ):
-        rendered = report(compare(paired, allow_protocol_mismatch=override))
+        rendered = report(compare(paired))
         assert sum(line.startswith("Protocol:") for line in rendered.splitlines()) == 1
+        assert len(protocol_block(rendered)) == 2
 
 
 # --------------------------------------------------------------------------------------
@@ -293,4 +331,4 @@ def test_the_package_imports_without_reaching_into_submodules() -> None:
     # they came from; `from robostats.compare import mcnemar` still works.
     assert callable(robostats.compare)
     assert callable(robostats.report)
-    assert robostats.SCHEMA_VERSION == 1
+    assert robostats.SCHEMA_VERSION == 2

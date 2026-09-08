@@ -20,13 +20,8 @@ from dataclasses import dataclass
 from scipy import stats
 from scipy.optimize import brentq
 
-from robostats.errors import ProtocolMismatchError, UnspecifiedProtocolError
 from robostats.intervals import ConfidenceInterval
-from robostats.records import (
-    SCHEMA_VERSION,
-    UNSPECIFIED_PROTOCOL_FINGERPRINT,
-    PairedResult,
-)
+from robostats.records import SCHEMA_VERSION, PairedResult
 
 __all__ = [
     "ComparisonResult",
@@ -489,15 +484,12 @@ class ComparisonResult:
     confidence : float
         Nominal confidence level of ``interval``.
     protocol_mismatch : bool
-        Whether this comparison crossed differing protocols. ``True`` only when
-        a mismatch was found and waived with ``allow_protocol_mismatch=True``,
-        so that a downstream report can state it. An override that leaves no
-        trace in the output is not an override, it is a silent defect.
-    protocol_unspecified : bool
-        Whether both sides recorded no protocol at all. Kept distinct from
-        ``protocol_mismatch``: a mismatch means the two protocols are known and
-        differ, while this means neither is known and the check that passed had
-        nothing to compare.
+        Whether the two sides carry different sets of protocol fingerprints.
+        Descriptive only: a differing protocol does not block the comparison,
+        and this field does not record that anything was overridden. Two sides
+        that both declared nothing fingerprint alike, so this is ``False`` for
+        them; what they declared is visible in the fingerprint tuples below and
+        in the report.
     protocol_fingerprints_a, protocol_fingerprints_b : tuple of str
         The distinct protocol fingerprints found on each side, carried so a
         report can name them without re-reading the records.
@@ -521,7 +513,6 @@ class ComparisonResult:
     dropped_from_b: int
     confidence: float
     protocol_mismatch: bool
-    protocol_unspecified: bool
     protocol_fingerprints_a: tuple[str, ...]
     protocol_fingerprints_b: tuple[str, ...]
     schema_version: int = SCHEMA_VERSION
@@ -532,7 +523,6 @@ def compare(
     *,
     confidence: float = 0.95,
     method: str = "exact",
-    allow_protocol_mismatch: bool = False,
 ) -> ComparisonResult:
     """Compare two policies evaluated on the same scenarios.
 
@@ -553,39 +543,30 @@ def compare(
         Which McNemar variant computes the p-value. See :func:`mcnemar`; the
         exact test is preferred at every sample size and there is no automatic
         selection between the two.
-    allow_protocol_mismatch : bool, default False
-        Waive the protocol checks below. The mismatch is then recorded on the
-        result rather than suppressed.
 
     Returns
     -------
     ComparisonResult
         The estimate, its interval, the p-value, the counts they came from, and
-        whether the comparison crossed protocols.
+        the protocol fingerprints each side carried.
 
     Raises
     ------
     ValueError
         If ``method`` is not ``"exact"`` or ``"chi2"``, or if ``confidence``
-        lies outside ``(0, 1)``. Both are caller errors and are checked before
-        the data.
-    ProtocolMismatchError
-        Unless ``allow_protocol_mismatch=True``, if the two sides carry
-        different protocol fingerprints, or if either side carries more than
-        one fingerprint internally. A side that mixed protocols cannot take part
-        in a sound comparison, whichever side it is compared against.
-    UnspecifiedProtocolError
-        Unless ``allow_protocol_mismatch=True``, if both sides recorded no
-        protocol at all. Two empty protocols fingerprint identically, so the
-        mismatch check above passes with nothing to compare; that is the one
-        case where a passing check means least, so it is raised rather than
-        allowed to look like agreement.
+        lies outside ``(0, 1)``.
 
     Notes
     -----
-    Comparing runs collected under different protocols is the error this package
-    exists to catch, so the check is never waived by default and never waived
-    from the data.
+    The protocol does not block anything. Only what changes the meaning of the
+    p-value and the interval is required, and that is scenario identity, which
+    :func:`~robostats.records.pair` enforces because without a join key there is
+    no paired comparison to compute. Differing protocols, and a side that mixed
+    protocols internally, are recorded and reported instead: an execution
+    horizon is a deployment choice rather than a property of the measurement,
+    and two policies with different natural chunk sizes are a legitimate
+    comparison. Whether one is sound is the reader's judgement, not this
+    function's.
     """
     if method not in METHODS:
         raise ValueError(
@@ -594,22 +575,6 @@ def compare(
         )
     if not 0.0 < confidence < 1.0:
         raise ValueError(f"confidence must lie strictly inside (0, 1), got {confidence!r}")
-
-    # Mismatch first: one side specified and one not is a mismatch, since their
-    # fingerprints differ, and it is reported as one rather than as an
-    # unspecified comparison.
-    protocol_mismatch = _protocol_mismatch(paired)
-    if protocol_mismatch and not allow_protocol_mismatch:
-        raise ProtocolMismatchError(_protocol_mismatch_message(paired))
-    protocol_unspecified = _protocol_unspecified(paired)
-    if protocol_unspecified and not allow_protocol_mismatch:
-        raise UnspecifiedProtocolError(
-            "both sides recorded no protocol at all: every field of their Protocol is "
-            "unset, so the two fingerprint identically and the protocol check above "
-            "compared nothing. Record the protocol both runs were collected under, or "
-            "pass allow_protocol_mismatch=True to compare anyway; the result then "
-            "records protocol_unspecified=True."
-        )
 
     test = mcnemar(paired, method=method)
     interval = paired_difference(paired, confidence=confidence)
@@ -629,8 +594,7 @@ def compare(
         dropped_from_a=paired.dropped_from_a,
         dropped_from_b=paired.dropped_from_b,
         confidence=confidence,
-        protocol_mismatch=protocol_mismatch,
-        protocol_unspecified=protocol_unspecified,
+        protocol_mismatch=_protocol_mismatch(paired),
         protocol_fingerprints_a=paired.protocol_fingerprints_a,
         protocol_fingerprints_b=paired.protocol_fingerprints_b,
         schema_version=SCHEMA_VERSION,
@@ -638,46 +602,11 @@ def compare(
 
 
 def _protocol_mismatch(paired: PairedResult) -> bool:
-    """Whether the two sides fail the protocol checks of :func:`compare`.
+    """Whether the two sides carry different sets of protocol fingerprints.
 
-    True if the two sides carry different sets of fingerprints, or if either
-    side carries more than one. A side that mixed protocols is not comparable to
-    anything, including a side that mixed them the same way, so the internal
-    check is not subsumed by the equality check.
+    Descriptive, not a gate. A side carrying more than one fingerprint mixed
+    protocols internally, which is visible in the tuple itself and stated by the
+    report; it is not folded into this flag, which answers only whether the two
+    sides declared the same thing as each other.
     """
-    fingerprints_a = paired.protocol_fingerprints_a
-    fingerprints_b = paired.protocol_fingerprints_b
-    if len(fingerprints_a) > 1 or len(fingerprints_b) > 1:
-        return True
-    return set(fingerprints_a) != set(fingerprints_b)
-
-
-def _protocol_unspecified(paired: PairedResult) -> bool:
-    """Whether both sides carry only the fingerprint of a fully unset protocol."""
-    unspecified = (UNSPECIFIED_PROTOCOL_FINGERPRINT,)
-    return (
-        paired.protocol_fingerprints_a == unspecified
-        and paired.protocol_fingerprints_b == unspecified
-    )
-
-
-def _protocol_mismatch_message(paired: PairedResult) -> str:
-    """Name the fingerprints found on each side, and which check they failed."""
-    fingerprints_a = paired.protocol_fingerprints_a
-    fingerprints_b = paired.protocol_fingerprints_b
-    reasons = []
-    for name, fingerprints in (("a", fingerprints_a), ("b", fingerprints_b)):
-        if len(fingerprints) > 1:
-            reasons.append(
-                f"side {name!r} mixes {len(fingerprints)} protocols internally, so no "
-                f"comparison involving it can be sound"
-            )
-    if set(fingerprints_a) != set(fingerprints_b):
-        reasons.append("the two sides were collected under different protocols")
-    return (
-        f"{'; '.join(reasons)}. "
-        f"Fingerprints on side 'a': {', '.join(repr(value) for value in fingerprints_a)}. "
-        f"Fingerprints on side 'b': {', '.join(repr(value) for value in fingerprints_b)}. "
-        f"Pass allow_protocol_mismatch=True to compare anyway; the result then records "
-        f"protocol_mismatch=True."
-    )
+    return set(paired.protocol_fingerprints_a) != set(paired.protocol_fingerprints_b)

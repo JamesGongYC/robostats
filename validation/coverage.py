@@ -466,6 +466,8 @@ def paired_interval_bounds(
     intervals = [
         paired_difference(
             PairedResult(
+                policy_id_a="a",
+                policy_id_b="b",
                 n_both_success=int(n11),
                 n_a_success_b_failure=int(n12),
                 n_b_success_a_failure=int(n21),

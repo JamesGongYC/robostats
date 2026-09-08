@@ -15,7 +15,6 @@ __all__ = [
     "ProtocolMismatchError",
     "RobostatsError",
     "SchemaError",
-    "UnspecifiedProtocolError",
 ]
 
 
@@ -46,11 +45,11 @@ class MixedPolicyError(RobostatsError):
 class ProtocolMismatchError(RobostatsError):
     """Two sides of a comparison were collected under different protocols.
 
-    Raised when the protocol fingerprints of the two sides differ, or when one
-    side mixes protocols internally. Comparing runs collected under different
-    protocols is the error this package exists to catch, so it is never the
-    silent default; callers who mean it pass ``allow_protocol_mismatch=True``,
-    and the result then records that the comparison crossed protocols.
+    Nothing raises this. A differing protocol is reported rather than refused:
+    ``ComparisonResult.protocol_mismatch`` says the two sides' fingerprints
+    differ, and the report states what each side declared without adjudicating
+    whether the comparison is sound. The class is kept so the name does not
+    silently change meaning if a future decision reintroduces a blocking check.
     """
 
 
@@ -61,18 +60,4 @@ class LoadError(RobostatsError):
     expected there. Loading never guesses: a column that is absent, a value that
     is not recognisably a boolean, or a field the mapping does not name is an
     error rather than a default.
-    """
-
-
-class UnspecifiedProtocolError(RobostatsError):
-    """Both sides of a comparison recorded no protocol at all.
-
-    A :class:`~robostats.records.Protocol` with every field unset fingerprints
-    identically to any other empty one, so two runs whose protocol nobody
-    recorded pass the fingerprint check trivially. The package's central check
-    would then be most confident exactly where it knows least, which is why an
-    unspecified protocol on both sides is its own error rather than a match.
-
-    It is waived by the same ``allow_protocol_mismatch=True`` as a mismatch, and
-    the result records ``protocol_unspecified`` so a report can say so.
     """
