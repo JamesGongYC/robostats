@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import pytest
 import robostats
 from robostats.compare import compare, mcnemar, paired_difference
 from robostats.intervals import wilson
-from robostats.records import PairedResult, Protocol
+from robostats.records import LoadProvenance, PairedResult, Protocol
 from robostats.report import format_p_value, format_proportion, report
 
 SPECIFIED = (Protocol(execution_horizon=8, reset_mode="fixed", max_steps=300).fingerprint(),)
@@ -332,3 +333,84 @@ def test_the_package_imports_without_reaching_into_submodules() -> None:
     assert callable(robostats.compare)
     assert callable(robostats.report)
     assert robostats.SCHEMA_VERSION == 2
+
+
+# --------------------------------------------------------------------------------------
+# The join line
+# --------------------------------------------------------------------------------------
+
+
+def join_line(rendered: str) -> str:
+    """The single line stating what the join key was composed from."""
+    lines = [line for line in rendered.splitlines() if line.startswith("Joined on:")]
+    assert len(lines) == 1
+    return lines[0]
+
+
+def test_the_join_line_states_the_composition() -> None:
+    paired = dataclasses.replace(
+        table(10, 3, 1, 6),
+        scenario_spec_a=("suite", "task_id", "init_state_id"),
+        scenario_spec_b=("suite", "task_id", "init_state_id"),
+    )
+    assert join_line(report(compare(paired))) == (
+        "Joined on:     suite / task_id / init_state_id"
+    )
+
+
+def test_the_join_line_says_so_when_the_composition_is_unrecorded() -> None:
+    line = join_line(report(compare(table(10, 3, 1, 6))))
+    assert line == "Joined on:     scenario_id (composition not recorded)"
+
+
+@pytest.mark.parametrize(
+    ("spec_a", "spec_b"),
+    [(("seed",), None), (None, ("seed",))],
+)
+def test_a_composition_known_on_only_one_side_is_not_claimed_for_both(
+    spec_a: tuple[str, ...] | None, spec_b: tuple[str, ...] | None
+) -> None:
+    # Stating one side's composition would imply it covers the join, and the
+    # join is over both sides.
+    paired = dataclasses.replace(
+        table(10, 3, 1, 6), scenario_spec_a=spec_a, scenario_spec_b=spec_b
+    )
+    assert "not recorded" in join_line(report(compare(paired)))
+
+
+def test_the_join_line_is_never_omitted() -> None:
+    for spec in (None, ("seed",), ("suite", "task", "init")):
+        paired = dataclasses.replace(table(10, 3, 1, 6), scenario_spec_a=spec, scenario_spec_b=spec)
+        assert join_line(report(compare(paired)))
+
+
+def test_the_join_line_shows_a_literal_component_as_a_literal() -> None:
+    # A reader has to be able to tell "the configuration was pinned to
+    # demo_clean" from "there is a column called demo_clean".
+    paired = dataclasses.replace(
+        table(10, 3, 1, 6),
+        scenario_spec_a=("'demo_clean'", "task", "seed"),
+        scenario_spec_b=("'demo_clean'", "task", "seed"),
+    )
+    assert join_line(report(compare(paired))) == "Joined on:     'demo_clean' / task / seed"
+
+
+def test_excluded_counts_are_stated_per_side_when_present() -> None:
+    # A success rate whose denominator leaves out abandoned episodes is a
+    # different claim from one that does not. The package states the counts and
+    # adjusts nothing.
+    paired = dataclasses.replace(
+        table(10, 3, 1, 6),
+        provenance_b=LoadProvenance(excluded={"abandoned": 8, "unstable": 2}),
+    )
+    rendered = report(compare(paired))
+    line = next(line for line in rendered.splitlines() if line.startswith("Excluded:"))
+    assert "octo" in line
+    assert "abandoned=8" in line
+    assert "unstable=2" in line
+    # Nothing was adjusted for them.
+    assert compare(paired).n_pairs == 20
+
+
+def test_no_excluded_line_when_nothing_was_excluded() -> None:
+    assert "Excluded:" not in report(compare(table(10, 3, 1, 6)))

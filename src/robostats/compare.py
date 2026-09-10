@@ -21,7 +21,7 @@ from scipy import stats
 from scipy.optimize import brentq
 
 from robostats.intervals import ConfidenceInterval
-from robostats.records import SCHEMA_VERSION, PairedResult
+from robostats.records import SCHEMA_VERSION, LoadProvenance, PairedResult
 
 __all__ = [
     "ComparisonResult",
@@ -493,6 +493,15 @@ class ComparisonResult:
     protocol_fingerprints_a, protocol_fingerprints_b : tuple of str
         The distinct protocol fingerprints found on each side, carried so a
         report can name them without re-reading the records.
+    provenance_a, provenance_b : LoadProvenance or None
+        What each side's loader recorded: the preset that produced the mapping
+        and its version, and the episodes the source left out of the file.
+        Reported, never used in a calculation.
+    scenario_spec_a, scenario_spec_b : tuple of str, or None
+        The fields each side composed its ``scenario_id`` values from. ``None``
+        where unrecorded. Carried so the report can state what the join was on:
+        a reader who knows the benchmark can then see that a configuration field
+        was left out, which nothing else in the package can detect.
     schema_version : int
         The record schema version this comparison was computed under.
     """
@@ -515,6 +524,10 @@ class ComparisonResult:
     protocol_mismatch: bool
     protocol_fingerprints_a: tuple[str, ...]
     protocol_fingerprints_b: tuple[str, ...]
+    scenario_spec_a: tuple[str, ...] | None = None
+    scenario_spec_b: tuple[str, ...] | None = None
+    provenance_a: LoadProvenance | None = None
+    provenance_b: LoadProvenance | None = None
     schema_version: int = SCHEMA_VERSION
 
 
@@ -597,6 +610,10 @@ def compare(
         protocol_mismatch=_protocol_mismatch(paired),
         protocol_fingerprints_a=paired.protocol_fingerprints_a,
         protocol_fingerprints_b=paired.protocol_fingerprints_b,
+        scenario_spec_a=paired.scenario_spec_a,
+        scenario_spec_b=paired.scenario_spec_b,
+        provenance_a=paired.provenance_a,
+        provenance_b=paired.provenance_b,
         schema_version=SCHEMA_VERSION,
     )
 

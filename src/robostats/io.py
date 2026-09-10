@@ -1,29 +1,45 @@
 """Read evaluation output into records.
 
-Two formats, both from the standard library: JSONL, one record object per line,
-and CSV. There is no DataFrame dependency and no file-format plugin system. A
-caller who already has records in memory, from a DataFrame or anywhere else,
-should build a :class:`~robostats.records.RecordSet` directly rather than
-writing them to a file to read back.
+Three loaders, all from the standard library: JSONL, one record object per line;
+CSV; and a nested manifest, one JSON document holding run-level metadata once and
+the episodes separately, which is the shape every benchmark surveyed actually
+writes. There is no DataFrame dependency and no file-format plugin system. A
+caller who already holds records in memory should build a
+:class:`~robostats.records.RecordSet` directly rather than writing them to a file
+to read back.
 
 What these loaders will not do
 ------------------------------
-They never guess. The caller names the column for every field they want mapped,
-and a named column that is absent is an error rather than a missing value.
-Nothing is inferred from a column's name, so a file with a ``succ`` column and a
-mapping that says ``success`` fails, loudly, instead of being helped.
+They never guess. The caller names the source key for every field they want
+mapped, or supplies a literal value for it, and a named key that is absent is an
+error rather than a missing value. Nothing is inferred from a key's name, so a
+file with a ``succ`` key and a mapping that says ``success`` fails, loudly,
+instead of being helped. :func:`load_manifest` guesses no paths either:
+``episodes_at`` is required and explicit.
 
-They never invent a scenario identity. ``scenario_id`` is composed from columns
-the caller names, in the order given. It is never derived from row position or
-from an index column: ``episode_idx`` is provenance rather than identity, and a
-position-derived key silently produces mismatched pairs, which is the failure
-this package exists to catch. A caller who names no composition gets
-``scenario_id=None``, and :func:`~robostats.records.pair` raises later, which is
-the correct outcome.
+They never invent a scenario identity. ``scenario_id`` is composed from fields
+the caller names, in the order given, optionally behind literal components the
+caller supplies for identity that exists outside the data. It is never derived from row position, from
+an index column, or from the keys of a mapping-valued episode collection:
+``episode_idx`` is provenance rather than identity, and a position-derived key
+silently produces mismatched pairs.
+
+They record how they composed it. The returned :class:`RecordSet` carries
+``scenario_spec``, the ordered field names that went into ``scenario_id``, so
+that :func:`~robostats.records.pair` can refuse to join two sides whose keys were
+built from different fields. The package cannot know which fields *should* have
+been included; recording which ones were is what makes the difference visible.
+
+They apply a preset only when asked. ``benchmark="robotwin"`` is the caller
+stating which benchmark produced the file, and the package applying a mapping
+published in advance; see :mod:`robostats.presets`. Nothing inspects a file and
+decides which benchmark wrote it, an explicit argument always beats a preset
+default, and a file that does not match the preset raises rather than falling
+back to generic loading.
 
 They never read the protocol from the data. ``protocol`` is a required argument
 with no default and no inference from file contents, filenames, or sibling
-metadata files. A protocol column in the file is ignored.
+metadata files. A protocol field in the file is ignored.
 """
 
 from __future__ import annotations
@@ -31,17 +47,20 @@ from __future__ import annotations
 import csv
 import json
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from robostats.errors import LoadError, SchemaError
-from robostats.records import EpisodeRecord, Protocol, RecordSet
+from robostats.errors import LoadError, PresetMismatchError, SchemaError
+from robostats.presets import resolve_preset
+from robostats.records import EpisodeRecord, LoadProvenance, Protocol, RecordSet
 
 __all__ = [
     "DEFAULT_FALSE_VALUES",
     "DEFAULT_TRUE_VALUES",
     "load_csv",
     "load_jsonl",
+    "load_manifest",
 ]
 
 #: Cell values a CSV loader accepts as ``success=True`` and ``success=False``.
@@ -52,24 +71,129 @@ DEFAULT_TRUE_VALUES = ("true", "1", "True")
 DEFAULT_FALSE_VALUES = ("false", "0", "False")
 
 
+@dataclass(frozen=True, slots=True)
+class _FieldMap:
+    """How the caller mapped record fields onto the source, shared by all loaders.
+
+    Each field is either read from a named source key or given as a literal. A
+    literal covers the case where the value exists only outside the data, such as
+    a policy name that is a directory component with no column to map.
+    """
+
+    success_field: str | None = None
+    policy_id: str | None = None
+    policy_id_field: str | None = None
+    task_id: str | None = None
+    task_id_field: str | None = None
+    scenario_fields: tuple[str, ...] = ()
+    scenario_prefix: tuple[str, ...] = ()
+    episode_idx_field: str | None = None
+    seed_field: str | None = None
+    run_id: str | None = None
+    run_id_field: str | None = None
+    success_detail_field: str | None = None
+
+    def validate(self, path: Path) -> None:
+        """Raise if a field was given twice, or a required field not at all.
+
+        Supplying both a literal and a source key for one field is a
+        :class:`~robostats.errors.LoadError`: the loader does not decide which
+        wins. Supplying neither, for a required field, is a ``TypeError``, since
+        it is a call that cannot be satisfied rather than a file that cannot be
+        read.
+        """
+        for field, literal, key in (
+            ("policy_id", self.policy_id, self.policy_id_field),
+            ("task_id", self.task_id, self.task_id_field),
+            ("run_id", self.run_id, self.run_id_field),
+        ):
+            if literal is not None and key is not None:
+                raise LoadError(
+                    f"{path}: the {field!r} field was given twice, as the literal "
+                    f"{literal!r} and as the source key {key!r}. Supply one or the "
+                    f"other; the loader does not decide which wins."
+                )
+        if self.success_field is None:
+            raise TypeError(
+                "success_field is required: pass the key to read success from, or a "
+                "benchmark= preset that supplies it"
+            )
+        for field, literal, key in (
+            ("policy_id", self.policy_id, self.policy_id_field),
+            ("task_id", self.task_id, self.task_id_field),
+        ):
+            if literal is None and key is None:
+                raise TypeError(
+                    f"{field} is required: pass {field}= with a literal value or "
+                    f"{field}_field= with the key to read it from"
+                )
+        if self.scenario_prefix and not self.scenario_fields:
+            raise LoadError(
+                f"{path}: scenario_prefix={self.scenario_prefix!r} was given without "
+                f"scenario_fields. A prefix is the same on every record, so it cannot "
+                f"identify a scenario on its own: every episode would receive the same "
+                f"key. Name the fields that distinguish one scenario from another."
+            )
+
+    @property
+    def source_keys(self) -> list[str]:
+        """Every source key the caller named, in a stable order, without repeats."""
+        candidates = [*(key for key in (self.success_field,) if key), *self.scenario_fields]
+        candidates.extend(
+            key
+            for key in (
+                self.policy_id_field,
+                self.task_id_field,
+                self.episode_idx_field,
+                self.seed_field,
+                self.run_id_field,
+                self.success_detail_field,
+            )
+            if key is not None
+        )
+        seen: list[str] = []
+        for key in candidates:
+            if key not in seen:
+                seen.append(key)
+        return seen
+
+    @property
+    def scenario_spec(self) -> tuple[str, ...] | None:
+        """The composition to record on the RecordSet, or ``None`` if nothing composed.
+
+        Literal components are recorded quoted, as ``repr()`` renders them, so
+        that a spec entry always says which kind of component it was: ``task`` is
+        a field read from the data and ``'demo_clean'`` is a value the caller
+        supplied. The mismatch check and the report both read this tuple, so the
+        distinction has to survive in it rather than only in the loader.
+        """
+        if not self.scenario_fields:
+            return None
+        return tuple(repr(value) for value in self.scenario_prefix) + tuple(self.scenario_fields)
+
+
 def load_jsonl(
     path: str | Path,
     *,
     protocol: Protocol,
-    policy_id_field: str,
-    task_id_field: str,
-    success_field: str,
+    benchmark: str | None = None,
+    success_field: str | None = None,
+    policy_id: str | None = None,
+    policy_id_field: str | None = None,
+    task_id: str | None = None,
+    task_id_field: str | None = None,
     scenario_fields: Sequence[str] = (),
+    scenario_prefix: Sequence[str] = (),
     episode_idx_field: str | None = None,
     seed_field: str | None = None,
+    run_id: str | None = None,
     run_id_field: str | None = None,
     success_detail_field: str | None = None,
 ) -> RecordSet:
     """Load records from a JSON Lines file, one record object per line.
 
     Each line is a JSON object whose keys the caller maps to record fields.
-    Blank lines are skipped; anything else that is not a JSON object is an
-    error.
+    Blank lines are skipped; anything else that is not a JSON object is an error.
 
     Parameters
     ----------
@@ -78,28 +202,47 @@ def load_jsonl(
     protocol : Protocol
         The protocol every record in this file was collected under. Required,
         and never inferred: a ``protocol`` key in the file is ignored.
-    policy_id_field, task_id_field, success_field : str
-        Keys holding the three required fields. ``success`` must be a JSON
-        boolean; a number or a string is an error, because thresholding a
-        non-boolean outcome is a decision the caller has to make explicitly.
+    benchmark : str or None
+        Name of a published preset to apply, from :mod:`robostats.presets`. The
+        caller states which benchmark wrote the file; nothing inspects it to
+        find out. Every argument below overrides the preset's value for that
+        field, and a file that does not match the preset raises
+        :class:`~robostats.errors.PresetMismatchError` rather than falling back.
+    success_field : str or None
+        Key holding ``success``, which must be a JSON boolean. Required unless a
+        preset supplies it. A number or a
+        string is an error, because thresholding a non-boolean outcome is a
+        decision the caller has to make explicitly.
+    policy_id, task_id, run_id : str or None
+        Literal values, for fields that exist outside the data, such as a policy
+        name that is only a directory component.
+    policy_id_field, task_id_field, run_id_field : str or None
+        Keys to read those fields from instead. Giving both the literal and the
+        key for one field is a :class:`~robostats.errors.LoadError`; giving
+        neither, for ``policy_id`` or ``task_id``, is a ``TypeError``.
     scenario_fields : Sequence[str], default ()
         Keys whose values compose ``scenario_id``, in this order, stringified
         with ``str()`` and joined with ``"/"``. Empty means ``scenario_id`` is
-        ``None``.
-    episode_idx_field, seed_field, run_id_field : str or None
-        Keys for the optional provenance fields. ``None`` means the field is not
-        mapped and is left as ``None`` on every record; naming a key means that
-        key must be present on every line.
+        ``None``. The composition is recorded on the returned set.
+    scenario_prefix : Sequence[str], default ()
+        Literal components placed at the front of every ``scenario_id``, before
+        the field-derived ones. This is for identity that exists outside the
+        data, such as a benchmark configuration that is only a directory name:
+        two runs under different configurations then produce different keys
+        instead of colliding. Given without ``scenario_fields`` it is a
+        :class:`~robostats.errors.LoadError`, since a constant cannot identify a
+        scenario.
+    episode_idx_field, seed_field : str or None
+        Keys for the optional provenance fields. ``None`` means unmapped; naming
+        a key means that key must be present on every line.
     success_detail_field : str or None
         Key holding a raw partial or continuous score, recorded as
-        ``success_detail``. It is never thresholded into ``success``, which the
-        caller maps separately: mapping a score here says what the harness
-        reported, not whether the episode succeeded.
+        ``success_detail``. It is never thresholded into ``success``.
 
     Returns
     -------
     RecordSet
-        The records, in file order.
+        The records, in file order, carrying ``scenario_spec``.
 
     Raises
     ------
@@ -107,58 +250,70 @@ def load_jsonl(
         If the file is missing, holds no records, or any line is not a JSON
         object, lacks a mapped key, or holds a value the schema rejects. The
         message names the file, the line number, and what was expected.
+    TypeError
+        If a required field was given neither as a literal nor as a key.
     """
     location = _Location(Path(path))
+    arguments, provenance = _apply_preset(
+        benchmark,
+        _explicit(
+            {
+                "success_field": success_field,
+                "policy_id": policy_id,
+                "policy_id_field": policy_id_field,
+                "task_id": task_id,
+                "task_id_field": task_id_field,
+                "scenario_fields": tuple(scenario_fields),
+                "scenario_prefix": tuple(scenario_prefix),
+                "episode_idx_field": episode_idx_field,
+                "seed_field": seed_field,
+                "run_id": run_id,
+                "run_id_field": run_id_field,
+                "success_detail_field": success_detail_field,
+            }
+        ),
+        location.path,
+        loader="jsonl",
+    )
+    mapping = _FieldMap(**arguments)
+    mapping.validate(location.path)
+
     records: list[EpisodeRecord] = []
     for line_number, line in _read_lines(location):
         text = line.strip()
         if not text:
             continue
-        try:
-            row = json.loads(text)
-        except json.JSONDecodeError as error:
-            raise LoadError(
-                f"{location.path}: line {line_number}: not valid JSON ({error.msg}); "
-                f"each line must be one JSON object"
-            ) from error
-        if not isinstance(row, dict):
-            raise LoadError(
-                f"{location.path}: line {line_number}: expected a JSON object, got "
-                f"{type(row).__name__}"
-            )
+        row = _parse_json_object(text, location.at(line_number))
+        if not records:
+            _check_preset_shape(benchmark, list(row), location.path)
         records.append(
             _build_record(
                 row,
                 location=location.at(line_number),
                 protocol=protocol,
-                policy_id_field=policy_id_field,
-                task_id_field=task_id_field,
-                success_field=success_field,
-                scenario_fields=scenario_fields,
-                episode_idx_field=episode_idx_field,
-                seed_field=seed_field,
-                run_id_field=run_id_field,
-                success_detail_field=success_detail_field,
-                read_success=_json_success,
-                read_integer=_json_integer,
-                read_number=_json_number,
+                mapping=mapping,
+                readers=_JSON_READERS,
             )
         )
     if not records:
         raise LoadError(f"{location.path}: holds no records; expected one JSON object per line")
-    return RecordSet(records)
+    return RecordSet(records, scenario_spec=mapping.scenario_spec, provenance=provenance)
 
 
 def load_csv(
     path: str | Path,
     *,
     protocol: Protocol,
-    policy_id_field: str,
-    task_id_field: str,
     success_field: str,
+    policy_id: str | None = None,
+    policy_id_field: str | None = None,
+    task_id: str | None = None,
+    task_id_field: str | None = None,
     scenario_fields: Sequence[str] = (),
+    scenario_prefix: Sequence[str] = (),
     episode_idx_field: str | None = None,
     seed_field: str | None = None,
+    run_id: str | None = None,
     run_id_field: str | None = None,
     success_detail_field: str | None = None,
     success_true_values: Sequence[str] = DEFAULT_TRUE_VALUES,
@@ -173,19 +328,22 @@ def load_csv(
     protocol : Protocol
         The protocol every record in this file was collected under. Required,
         and never inferred: a ``protocol`` column in the file is ignored.
-    policy_id_field, task_id_field, success_field : str
-        Column names holding the three required fields.
+    success_field : str
+        Column holding ``success``, read against the two value sets below.
+    policy_id, task_id, run_id : str or None
+        Literal values, for fields with no column to map.
+    policy_id_field, task_id_field, run_id_field : str or None
+        Columns to read those fields from instead. Giving both for one field is
+        a :class:`~robostats.errors.LoadError`.
     scenario_fields : Sequence[str], default ()
         Columns whose values compose ``scenario_id``, in this order, joined with
         ``"/"``. Empty means ``scenario_id`` is ``None``.
-    episode_idx_field, seed_field, run_id_field : str or None
-        Columns for the optional provenance fields. ``None`` means unmapped;
-        naming a column means it must be in the header. An empty cell reads as
-        ``None``.
-    success_detail_field : str or None
-        Column holding a raw partial or continuous score, recorded as
-        ``success_detail``. It is never thresholded into ``success``, which the
-        caller maps separately through ``success_field`` and its value sets.
+    scenario_prefix : Sequence[str], default ()
+        Literal components placed at the front of every ``scenario_id``, for
+        identity that exists outside the file.
+    episode_idx_field, seed_field, success_detail_field : str or None
+        Columns for the optional fields. ``None`` means unmapped; naming a
+        column means it must be in the header. An empty cell reads as ``None``.
     success_true_values, success_false_values : Sequence[str]
         The cell values that mean ``True`` and ``False``. CSV has no boolean
         type, so this is the caller's decision rather than the loader's. A cell
@@ -195,32 +353,37 @@ def load_csv(
     Returns
     -------
     RecordSet
-        The records, in file order.
+        The records, in file order, carrying ``scenario_spec``.
 
     Raises
     ------
     LoadError
         If the file is missing, has no header, holds no data rows, lacks a
-        mapped column, or holds an unrecognised success value. The message names
-        the file, the line number, and what was expected.
+        mapped column, or holds an unrecognised success value.
+    TypeError
+        If a required field was given neither as a literal nor as a column.
     """
     location = _Location(Path(path))
-    text = _read_text(location)
-    reader = csv.DictReader(text.splitlines())
-    if reader.fieldnames is None:
-        raise LoadError(f"{location.path}: is empty; expected a header row naming the columns")
-
-    mapped = _mapped_columns(
-        policy_id_field=policy_id_field,
-        task_id_field=task_id_field,
+    mapping = _FieldMap(
         success_field=success_field,
-        scenario_fields=scenario_fields,
+        policy_id=policy_id,
+        policy_id_field=policy_id_field,
+        task_id=task_id,
+        task_id_field=task_id_field,
+        scenario_fields=tuple(scenario_fields),
+        scenario_prefix=tuple(scenario_prefix),
         episode_idx_field=episode_idx_field,
         seed_field=seed_field,
+        run_id=run_id,
         run_id_field=run_id_field,
         success_detail_field=success_detail_field,
     )
-    missing = [column for column in mapped if column not in reader.fieldnames]
+    mapping.validate(location.path)
+
+    reader = csv.DictReader(_read_text(location).splitlines())
+    if reader.fieldnames is None:
+        raise LoadError(f"{location.path}: is empty; expected a header row naming the columns")
+    missing = [column for column in mapping.source_keys if column not in reader.fieldnames]
     if missing:
         raise LoadError(
             f"{location.path}: header is missing mapped column(s) "
@@ -229,25 +392,20 @@ def load_csv(
             f"Column names are taken literally and never matched loosely."
         )
 
-    def read_success(value: object, where: str) -> bool:
-        return _csv_success(value, where, success_true_values, success_false_values)
-
+    readers = _Readers(
+        success=lambda value, where: _csv_success(
+            value, where, success_true_values, success_false_values
+        ),
+        integer=_csv_integer,
+        number=_csv_number,
+    )
     records = [
         _build_record(
             row,
             location=location.at(reader.line_num),
             protocol=protocol,
-            policy_id_field=policy_id_field,
-            task_id_field=task_id_field,
-            success_field=success_field,
-            scenario_fields=scenario_fields,
-            episode_idx_field=episode_idx_field,
-            seed_field=seed_field,
-            run_id_field=run_id_field,
-            success_detail_field=success_detail_field,
-            read_success=read_success,
-            read_integer=_csv_integer,
-            read_number=_csv_number,
+            mapping=mapping,
+            readers=readers,
         )
         for row in reader
     ]
@@ -255,24 +413,223 @@ def load_csv(
         raise LoadError(
             f"{location.path}: holds a header but no data rows; expected at least one record"
         )
-    return RecordSet(records)
+    return RecordSet(records, scenario_spec=mapping.scenario_spec)
+
+
+def load_manifest(
+    path: str | Path,
+    *,
+    protocol: Protocol,
+    benchmark: str | None = None,
+    episodes_at: str | None = None,
+    success_field: str | None = None,
+    policy_id: str | None = None,
+    policy_id_field: str | None = None,
+    task_id: str | None = None,
+    task_id_field: str | None = None,
+    scenario_fields: Sequence[str] = (),
+    scenario_prefix: Sequence[str] = (),
+    run_fields: Sequence[str] = (),
+    episode_idx_field: str | None = None,
+    seed_field: str | None = None,
+    run_id: str | None = None,
+    run_id_field: str | None = None,
+    success_detail_field: str | None = None,
+) -> RecordSet:
+    """Load records from a nested JSON document: run metadata once, episodes apart.
+
+    This is the shape evaluation harnesses actually write. Run-level settings are
+    stored once at the top of a document and the per-episode outcomes sit in a
+    collection somewhere inside it, rather than being repeated on every row.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        The JSON document to read.
+    protocol : Protocol
+        The protocol every record in this document was collected under.
+        Required, and never inferred from the document's own contents.
+    benchmark : str or None
+        Name of a published preset to apply, as on :func:`load_jsonl`.
+    episodes_at : str or None
+        Dotted path to the episode collection, for example
+        ``"results.episodes"``. Required and explicit: no path is guessed. The
+        collection may be a list or a mapping. A mapping's keys are ignored,
+        because they are positional and positional identity is not scenario
+        identity.
+    success_field : str
+        Key holding ``success`` within each episode object.
+    policy_id, task_id, run_id : str or None
+        Literal values, for fields that exist only outside the document.
+    policy_id_field, task_id_field, run_id_field : str or None
+        Keys to read those fields from instead, resolved against the episode
+        object after ``run_fields`` have been hoisted onto it.
+    scenario_fields : Sequence[str], default ()
+        Keys composing ``scenario_id``, resolved the same way, so a run-level
+        field hoisted by ``run_fields`` may take part in the join key.
+    scenario_prefix : Sequence[str], default ()
+        Literal components placed at the front of every ``scenario_id``, for
+        identity that is neither in the episodes nor at the top of the document,
+        such as a configuration that is only a directory name.
+    run_fields : Sequence[str], default ()
+        Top-level keys to hoist onto every episode. Each must be present at the
+        top level of the document. A key named here that also appears in an
+        episode object is a :class:`~robostats.errors.LoadError`: the loader does
+        not decide which value wins.
+    episode_idx_field, seed_field, success_detail_field : str or None
+        Keys for the optional fields, resolved within each episode object.
+
+    Returns
+    -------
+    RecordSet
+        The records, in document order, carrying ``scenario_spec``.
+
+    Raises
+    ------
+    LoadError
+        If the document is missing or is not a JSON object, if ``episodes_at``
+        does not resolve, if the collection is empty or holds a non-object, if a
+        hoisted key is missing or collides with an episode key, or if any
+        episode lacks a mapped key. The message names the file, the episode
+        index, and what was expected.
+    TypeError
+        If a required field was given neither as a literal nor as a key.
+    """
+    location = _Location(Path(path), unit="episode")
+    arguments, provenance = _apply_preset(
+        benchmark,
+        _explicit(
+            {
+                "episodes_at": episodes_at,
+                "run_fields": tuple(run_fields),
+                "success_field": success_field,
+                "policy_id": policy_id,
+                "policy_id_field": policy_id_field,
+                "task_id": task_id,
+                "task_id_field": task_id_field,
+                "scenario_fields": tuple(scenario_fields),
+                "scenario_prefix": tuple(scenario_prefix),
+                "episode_idx_field": episode_idx_field,
+                "seed_field": seed_field,
+                "run_id": run_id,
+                "run_id_field": run_id_field,
+                "success_detail_field": success_detail_field,
+            }
+        ),
+        location.path,
+        loader="manifest",
+    )
+    episodes_at = arguments.pop("episodes_at", None)
+    run_fields = tuple(arguments.pop("run_fields", ()))
+    if episodes_at is None:
+        raise TypeError(
+            "episodes_at is required: pass the dotted path to the episode collection, "
+            "or a benchmark= preset that supplies it"
+        )
+    mapping = _FieldMap(**arguments)
+    mapping.validate(location.path)
+
+    document = _parse_json_object(_read_text(location), location)
+    run_values = _hoisted_values(document, run_fields, location)
+    episodes = _resolve_episodes(document, episodes_at, location)
+
+    records: list[EpisodeRecord] = []
+    for index, episode in enumerate(episodes):
+        where = location.at(index)
+        if not isinstance(episode, dict):
+            raise LoadError(
+                f"{where}: expected a JSON object, got {type(episode).__name__}"
+            )
+        if not records:
+            _check_preset_shape(benchmark, list({**run_values, **episode}), location.path)
+        collisions = [key for key in run_values if key in episode]
+        if collisions:
+            raise LoadError(
+                f"{where}: {', '.join(repr(key) for key in collisions)} named in run_fields "
+                f"and also present on the episode. The loader does not decide which value "
+                f"wins; rename one or drop it from run_fields."
+            )
+        records.append(
+            _build_record(
+                {**run_values, **episode},
+                location=where,
+                protocol=protocol,
+                mapping=mapping,
+                readers=_JSON_READERS,
+            )
+        )
+    if not records:
+        raise LoadError(
+            f"{location.path}: the collection at {episodes_at!r} is empty; expected at "
+            f"least one episode"
+        )
+    return RecordSet(records, scenario_spec=mapping.scenario_spec, provenance=provenance)
+
+
+@dataclass(frozen=True, slots=True)
+class _Readers:
+    """How one format reads the three value types that are not plain strings."""
+
+    success: Any
+    integer: Any
+    number: Any
+
+
+def _explicit(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep only the arguments the caller actually set.
+
+    ``None`` and an empty sequence both mean "not given", so a preset's value
+    survives; anything else is the caller's and wins.
+    """
+    return {key: value for key, value in arguments.items() if value not in (None, (), [])}
+
+
+def _apply_preset(
+    benchmark: str | None, explicit: dict[str, Any], path: Path, loader: str
+) -> tuple[dict[str, Any], LoadProvenance | None]:
+    """Merge a named preset's arguments under the caller's, if one was named.
+
+    Returns the arguments to load with and what to record about the preset. An
+    explicit argument always wins: some fields exist only outside the data, and
+    a preset that could not be overridden would make those files unloadable.
+    """
+    if benchmark is None:
+        return explicit, None
+    preset = resolve_preset(benchmark)
+    if preset.loader != loader:
+        raise PresetMismatchError(
+            f"{path}: the {preset.name!r} preset reads {preset.source} with "
+            f"load_{preset.loader}(), not load_{loader}()."
+        )
+    return preset.merge(explicit), LoadProvenance(
+        preset=preset.name, preset_version=preset.version
+    )
+
+
+def _check_preset_shape(benchmark: str | None, keys: Sequence[str], path: Path) -> None:
+    """Check the first episode against the named preset, if one was named."""
+    if benchmark is not None:
+        resolve_preset(benchmark).check_shape(keys, path)
 
 
 class _Location:
-    """Where an error happened, for messages: a file and optionally a line."""
+    """Where an error happened, for messages: a file and optionally a position."""
 
-    __slots__ = ("line", "path")
+    __slots__ = ("path", "position", "unit")
 
-    def __init__(self, path: Path, line: int | None = None) -> None:
+    def __init__(self, path: Path, position: int | None = None, unit: str = "line") -> None:
         self.path = path
-        self.line = line
+        self.position = position
+        self.unit = unit
 
-    def at(self, line: int) -> _Location:
-        """Return this location narrowed to one line."""
-        return _Location(self.path, line)
+    def at(self, position: int) -> _Location:
+        """Return this location narrowed to one line or episode."""
+        return _Location(self.path, position, self.unit)
 
     def __str__(self) -> str:
-        return f"{self.path}" if self.line is None else f"{self.path}: line {self.line}"
+        if self.position is None:
+            return f"{self.path}"
+        return f"{self.path}: {self.unit} {self.position}"
 
 
 def _read_text(location: _Location) -> str:
@@ -288,40 +645,77 @@ def _read_lines(location: _Location) -> Iterable[tuple[int, str]]:
     return enumerate(_read_text(location).splitlines(), start=1)
 
 
-def _mapped_columns(
-    *,
-    policy_id_field: str,
-    task_id_field: str,
-    success_field: str,
-    scenario_fields: Sequence[str],
-    episode_idx_field: str | None,
-    seed_field: str | None,
-    run_id_field: str | None,
-    success_detail_field: str | None,
-) -> list[str]:
-    """Return every column the caller mapped, in a stable order, without repeats."""
-    candidates = [policy_id_field, task_id_field, success_field, *scenario_fields]
-    candidates.extend(
-        field
-        for field in (episode_idx_field, seed_field, run_id_field, success_detail_field)
-        if field is not None
+def _parse_json_object(text: str, location: _Location) -> dict[str, Any]:
+    """Parse ``text`` as a JSON object, or raise naming where it failed."""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise LoadError(f"{location}: not valid JSON ({error.msg})") from error
+    if not isinstance(parsed, dict):
+        raise LoadError(f"{location}: expected a JSON object, got {type(parsed).__name__}")
+    return parsed
+
+
+def _resolve_episodes(
+    document: Mapping[str, Any], episodes_at: str, location: _Location
+) -> list[Any]:
+    """Walk the dotted path to the episode collection and return it as a list.
+
+    A mapping-valued collection contributes its values in document order; its
+    keys are discarded, because they are positional and position is not identity.
+    """
+    node: Any = document
+    walked: list[str] = []
+    for key in episodes_at.split("."):
+        if not isinstance(node, dict):
+            raise LoadError(
+                f"{location.path}: episodes_at={episodes_at!r} passes through "
+                f"{'.'.join(walked) or '<document>'}, which is "
+                f"{type(node).__name__}, not an object"
+            )
+        if key not in node:
+            raise LoadError(
+                f"{location.path}: episodes_at={episodes_at!r} does not resolve: no key "
+                f"{key!r} at {'.'.join(walked) or '<document>'}. Keys present: "
+                f"{', '.join(repr(name) for name in node)}. Paths are explicit and never "
+                f"guessed."
+            )
+        node = node[key]
+        walked.append(key)
+
+    if isinstance(node, list):
+        return node
+    if isinstance(node, dict):
+        return list(node.values())
+    raise LoadError(
+        f"{location.path}: episodes_at={episodes_at!r} resolves to {type(node).__name__}, "
+        f"but the episode collection must be a list or an object"
     )
-    seen: list[str] = []
-    for column in candidates:
-        if column not in seen:
-            seen.append(column)
-    return seen
 
 
-def _require(row: Mapping[str, Any], column: str, location: _Location, field: str) -> Any:
-    """Return ``row[column]``, or raise naming the field, the column and what is present."""
-    if column not in row:
+def _hoisted_values(
+    document: Mapping[str, Any], run_fields: tuple[str, ...], location: _Location
+) -> dict[str, Any]:
+    """Return the run-level values to merge onto every episode."""
+    missing = [key for key in run_fields if key not in document]
+    if missing:
         raise LoadError(
-            f"{location}: no key {column!r}, which is mapped to the {field!r} field. "
-            f"Keys present: {', '.join(repr(key) for key in row)}. "
+            f"{location.path}: run_fields names {', '.join(repr(key) for key in missing)}, "
+            f"absent from the top level of the document. Keys present: "
+            f"{', '.join(repr(key) for key in document)}."
+        )
+    return {key: document[key] for key in run_fields}
+
+
+def _require(row: Mapping[str, Any], key: str, location: _Location, field: str) -> Any:
+    """Return ``row[key]``, or raise naming the field, the key and what is present."""
+    if key not in row:
+        raise LoadError(
+            f"{location}: no key {key!r}, which is mapped to the {field!r} field. "
+            f"Keys present: {', '.join(repr(name) for name in row)}. "
             f"Names are taken literally and never matched loosely."
         )
-    return row[column]
+    return row[key]
 
 
 def _json_success(value: object, where: str) -> bool:
@@ -395,15 +789,34 @@ def _csv_number(value: object, where: str, field: str) -> float | None:
         raise LoadError(f"{where}: {field} is {value!r}, which is not a number") from error
 
 
+#: Readers for the JSON-shaped formats, which carry their own types.
+_JSON_READERS = _Readers(success=_json_success, integer=_json_integer, number=_json_number)
+
+
 def _compose_scenario_id(
-    row: Mapping[str, Any], scenario_fields: Sequence[str], location: _Location
+    row: Mapping[str, Any], mapping: _FieldMap, location: _Location
 ) -> str | None:
-    """Join the named columns into a ``scenario_id``, or return ``None`` if none named."""
-    if not scenario_fields:
+    """Join the literal prefix and the named fields into a ``scenario_id``.
+
+    Returns ``None`` when no fields were named. Literal components come first,
+    in the order given, so the position of every component is defined by the
+    call rather than by the data: two sides that pass different literals in the
+    same position produce different keys, which is the point of allowing them.
+    """
+    if not mapping.scenario_fields:
         return None
-    return "/".join(
-        str(_require(row, column, location, "scenario_id")) for column in scenario_fields
-    )
+    parts = [*mapping.scenario_prefix]
+    for key in mapping.scenario_fields:
+        value = _require(row, key, location, "scenario_id")
+        if value is None:
+            raise LoadError(
+                f"{location}: {key!r} is null, and it composes scenario_id. Stringifying "
+                f"it would make the key 'None', which matches every other episode whose "
+                f"key was built the same way, so a join on it would pair unrelated "
+                f"scenarios."
+            )
+        parts.append(str(value))
+    return "/".join(parts)
 
 
 def _build_record(
@@ -411,54 +824,48 @@ def _build_record(
     *,
     location: _Location,
     protocol: Protocol,
-    policy_id_field: str,
-    task_id_field: str,
-    success_field: str,
-    scenario_fields: Sequence[str],
-    episode_idx_field: str | None,
-    seed_field: str | None,
-    run_id_field: str | None,
-    success_detail_field: str | None,
-    read_success: Any,
-    read_integer: Any,
-    read_number: Any,
+    mapping: _FieldMap,
+    readers: _Readers,
 ) -> EpisodeRecord:
     """Build one record from one row, or raise a LoadError naming where it failed."""
     where = str(location)
-    success = read_success(_require(row, success_field, location, "success"), where)
-    episode_idx = (
-        None
-        if episode_idx_field is None
-        else read_integer(
-            _require(row, episode_idx_field, location, "episode_idx"), where, "episode_idx"
+
+    def literal_or_key(literal: str | None, key: str | None, field: str) -> Any:
+        if literal is not None:
+            return literal
+        if key is None:
+            return None
+        return _require(row, key, location, field)
+
+    optional_integer = {
+        field: readers.integer(_require(row, key, location, field), where, field)
+        for field, key in (
+            ("episode_idx", mapping.episode_idx_field),
+            ("seed", mapping.seed_field),
         )
-    )
-    seed = (
-        None
-        if seed_field is None
-        else read_integer(_require(row, seed_field, location, "seed"), where, "seed")
-    )
-    run_id_value = None if run_id_field is None else _require(row, run_id_field, location, "run_id")
+        if key is not None
+    }
     success_detail = (
         None
-        if success_detail_field is None
-        else read_number(
-            _require(row, success_detail_field, location, "success_detail"),
+        if mapping.success_detail_field is None
+        else readers.number(
+            _require(row, mapping.success_detail_field, location, "success_detail"),
             where,
             "success_detail",
         )
     )
+    run_id = literal_or_key(mapping.run_id, mapping.run_id_field, "run_id")
     try:
         return EpisodeRecord(
-            policy_id=_require(row, policy_id_field, location, "policy_id"),
-            task_id=_require(row, task_id_field, location, "task_id"),
-            success=success,
-            scenario_id=_compose_scenario_id(row, scenario_fields, location),
+            policy_id=literal_or_key(mapping.policy_id, mapping.policy_id_field, "policy_id"),
+            task_id=literal_or_key(mapping.task_id, mapping.task_id_field, "task_id"),
+            success=readers.success(_require(row, mapping.success_field, location, "success"), where),
+            scenario_id=_compose_scenario_id(row, mapping, location),
             protocol=protocol,
-            episode_idx=episode_idx,
-            seed=seed,
+            episode_idx=optional_integer.get("episode_idx"),
+            seed=optional_integer.get("seed"),
             success_detail=success_detail,
-            run_id=None if run_id_value is None else str(run_id_value),
+            run_id=None if run_id is None else str(run_id),
         )
     except SchemaError as error:
         raise LoadError(f"{where}: {error}") from error

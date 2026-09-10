@@ -5,8 +5,9 @@ where its output belongs: that is the caller's decision. There is no colour, no
 terminal-width detection, and no dependency. Calling it twice on the same result
 returns the same string.
 
-The report always states what each side declared as its protocol, including when
-a side declared nothing, which renders as ``(not recorded)``. It never comments
+The report always states what the join key was composed from and what each side
+declared as its protocol, including when nothing was recorded, which renders as
+``(not recorded)``. It never comments
 on whether the comparison is sound: the package does not adjudicate that. A line
 that appeared only on trouble would train readers to stop looking for it, and a
 visible blank makes the case for recording these fields better than an exception
@@ -14,6 +15,8 @@ does.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 from robostats.compare import ComparisonResult, McNemarResult
 from robostats.intervals import ConfidenceInterval
@@ -115,6 +118,72 @@ def _describe_protocol(fingerprints: tuple[str, ...]) -> str:
     return f"{len(fingerprints)} protocols: {listed}"
 
 
+def _join_line(result: ComparisonResult) -> str:
+    """State what the join key was composed from, always.
+
+    A reader who knows the benchmark can see at a glance that a configuration
+    field was left out of the key, which nothing else in the package can detect:
+    two runs whose keys omit the same field agree with each other, and the join
+    succeeds on identifiers that mean different things. This line is the last
+    line of defence, so it is never omitted.
+
+    The composition is stated only when both sides recorded the same one. Where
+    either side was built directly, the package does not know how its keys were
+    made and says so rather than implying the other side's composition covers
+    both.
+    """
+    spec_a = result.scenario_spec_a
+    spec_b = result.scenario_spec_b
+    if spec_a is not None and spec_a == spec_b:
+        return f"{'Joined on:':<{_LABEL_WIDTH}}{' / '.join(spec_a)}"
+    return f"{'Joined on:':<{_LABEL_WIDTH}}scenario_id (composition not recorded)"
+
+
+def _provenance_lines(result: ComparisonResult) -> list[str]:
+    """State what each side's loader recorded, where it recorded anything.
+
+    Two things travel here, and neither changes a statistic. The preset says
+    which published mapping produced the records, with its version, so a mapping
+    that has gone stale is traceable rather than mysterious. The excluded counts
+    say how many episodes the source left out of the file: a success rate whose
+    denominator omits abandoned episodes is a different claim from one that does
+    not, and that difference is invisible in the records. The package states the
+    counts and adjusts nothing.
+    """
+    sides = (
+        (result.policy_id_a, result.provenance_a),
+        (result.policy_id_b, result.provenance_b),
+    )
+    name_width = max(len(policy) for policy, _ in sides)
+
+    def block(label: str, describe: Any) -> list[str]:
+        rows = [
+            (policy, described)
+            for policy, provenance in sides
+            if provenance is not None and (described := describe(provenance)) is not None
+        ]
+        return [
+            f"{label if index == 0 else '':<{_LABEL_WIDTH}}{policy:<{name_width}}  {described}"
+            for index, (policy, described) in enumerate(rows)
+        ]
+
+    return block(
+        "Preset:",
+        lambda provenance: (
+            None
+            if provenance.preset is None
+            else f"{provenance.preset} (version {provenance.preset_version})"
+        ),
+    ) + block(
+        "Excluded:",
+        lambda provenance: (
+            None
+            if not provenance.excluded
+            else ", ".join(f"{name}={count}" for name, count in provenance.excluded.items())
+        ),
+    )
+
+
 def _protocol_lines(result: ComparisonResult) -> list[str]:
     """One line per side, always present, stating what that side declared."""
     sides = (
@@ -152,7 +221,9 @@ def _comparison_report(result: ComparisonResult) -> str:
             f"Dropped:       {result.dropped_from_a} from {result.policy_id_a}, "
             f"{result.dropped_from_b} from {result.policy_id_b}"
         ),
+        _join_line(result),
         *_protocol_lines(result),
+        *_provenance_lines(result),
     ]
     return "\n".join(lines)
 

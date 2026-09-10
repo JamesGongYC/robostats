@@ -16,6 +16,7 @@ A caller who already holds records in memory, from a DataFrame or anywhere else,
 builds a :class:`RecordSet` directly and skips the loaders.
 """
 
+from robostats import adapters
 from robostats.compare import (
     ComparisonResult,
     McNemarResult,
@@ -23,17 +24,25 @@ from robostats.compare import (
     mcnemar,
     paired_difference,
 )
-from robostats.errors import RobostatsError
+from robostats.errors import (
+    PresetMismatchError,
+    PresetNotFoundError,
+    RobostatsError,
+    ScenarioSpecMismatchError,
+)
 from robostats.intervals import (
     ConfidenceInterval,
     agresti_coull,
     clopper_pearson,
     wilson,
 )
-from robostats.io import load_csv, load_jsonl
+from robostats.io import load_csv, load_jsonl, load_manifest
+from robostats.presets import Preset, describe_preset, preset_names, register_preset
+from robostats.recording import EpisodeRecorder
 from robostats.records import (
     SCHEMA_VERSION,
     EpisodeRecord,
+    LoadProvenance,
     PairedResult,
     Protocol,
     RecordSet,
@@ -50,20 +59,31 @@ __all__ = [
     "ComparisonResult",
     "ConfidenceInterval",
     "EpisodeRecord",
+    "EpisodeRecorder",
+    "LoadProvenance",
     "McNemarResult",
     "PairedResult",
+    "Preset",
+    "PresetMismatchError",
+    "PresetNotFoundError",
     "Protocol",
     "RecordSet",
     "RobostatsError",
+    "ScenarioSpecMismatchError",
     "__version__",
+    "adapters",
     "agresti_coull",
     "clopper_pearson",
     "compare",
+    "describe_preset",
     "load_csv",
     "load_jsonl",
+    "load_manifest",
     "mcnemar",
     "pair",
     "paired_difference",
+    "preset_names",
+    "register_preset",
     "report",
     "wilson",
 ]

@@ -12,8 +12,11 @@ __all__ = [
     "LoadError",
     "MissingScenarioIdError",
     "MixedPolicyError",
+    "PresetMismatchError",
+    "PresetNotFoundError",
     "ProtocolMismatchError",
     "RobostatsError",
+    "ScenarioSpecMismatchError",
     "SchemaError",
 ]
 
@@ -60,4 +63,34 @@ class LoadError(RobostatsError):
     expected there. Loading never guesses: a column that is absent, a value that
     is not recognisably a boolean, or a field the mapping does not name is an
     error rather than a default.
+    """
+
+
+class ScenarioSpecMismatchError(RobostatsError):
+    """Two sides composed their ``scenario_id`` values from different fields.
+
+    A join key is only meaningful next to another key built the same way. If one
+    run identified a scenario by its seed and the other by its layout id, the
+    strings can match exactly while referring to unrelated scenes, and the join
+    succeeds with a plausible, wrong result.
+
+    This is arithmetic rather than protocol: without comparable keys there is no
+    paired comparison to compute. The package cannot know which fields *should*
+    have been included, only which ones were, so it refuses when the two
+    recorded compositions differ and says nothing when either is unknown.
+    """
+
+
+class PresetNotFoundError(RobostatsError):
+    """No preset is registered under the requested name."""
+
+
+class PresetMismatchError(RobostatsError):
+    """A file does not have the shape the named preset expects.
+
+    A preset applies wholly or not at all. There is no quiet fallback to generic
+    loading and no partial application: a file that does not match the mapping
+    the user declared is a file the user is wrong about, and guessing which half
+    of the mapping still applies would be the inference this package refuses to
+    do.
     """

@@ -901,3 +901,33 @@ def test_compare_carries_nonzero_dropped_counts() -> None:
     result = compare(paired)
     assert (result.dropped_from_a, result.dropped_from_b) == (4, 7)
     assert result.n_pairs == 20
+
+
+@pytest.mark.parametrize(
+    ("spec_a", "spec_b"),
+    [(("task", "seed"), ("task", "seed")), (None, None), (("seed",), None)],
+)
+def test_compare_carries_the_join_key_composition(
+    spec_a: tuple[str, ...] | None, spec_b: tuple[str, ...] | None
+) -> None:
+    # Nothing downstream can recover how the keys were built, and the report is
+    # the last place a reader can notice that a configuration field was omitted.
+    paired = PairedResult(
+        policy_id_a="pi_zero",
+        policy_id_b="octo",
+        n_both_success=10,
+        n_a_success_b_failure=3,
+        n_b_success_a_failure=1,
+        n_both_failure=6,
+        scenario_ids=tuple(f"scenario_{index:04d}" for index in range(20)),
+        dropped_from_a=0,
+        dropped_from_b=0,
+        protocol_fingerprints_a=("fingerprint",),
+        protocol_fingerprints_b=("fingerprint",),
+        replicates="strict",
+        scenario_spec_a=spec_a,
+        scenario_spec_b=spec_b,
+    )
+    result = compare(paired)
+    assert result.scenario_spec_a == spec_a
+    assert result.scenario_spec_b == spec_b

@@ -9,15 +9,24 @@ import sys
 import numpy as np
 import pytest
 
+from robostats import records as records_module
 from robostats.errors import (
     DuplicateScenarioError,
     EmptyRecordSetError,
     MissingScenarioIdError,
     MixedPolicyError,
     RobostatsError,
+    ScenarioSpecMismatchError,
     SchemaError,
 )
-from robostats.records import EpisodeRecord, PairedResult, Protocol, RecordSet, pair
+from robostats.records import (
+    SCHEMA_VERSION,
+    EpisodeRecord,
+    PairedResult,
+    Protocol,
+    RecordSet,
+    pair,
+)
 
 
 def record(
@@ -48,6 +57,42 @@ def test_fingerprint_ignores_extra_insertion_order() -> None:
     first = Protocol(extra={"alpha": 1, "beta": 2})
     second = Protocol(extra={"beta": 2, "alpha": 1})
     assert first.fingerprint() == second.fingerprint()
+
+
+@pytest.mark.parametrize(
+    "protocol",
+    [
+        Protocol(),
+        Protocol(execution_horizon=8),
+        Protocol(execution_horizon=8, reset_mode="hard", max_steps=520, extra={"suite": "libero"}),
+    ],
+)
+@pytest.mark.parametrize("version", [1, 2, 3, 99])
+def test_fingerprint_does_not_depend_on_the_schema_version(
+    monkeypatch: pytest.MonkeyPatch, protocol: Protocol, version: int
+) -> None:
+    # A fingerprint answers whether two runs were configured the same way, not
+    # whether they were recorded by the same version of this package. Including
+    # SCHEMA_VERSION in the payload made every fingerprint change on a schema
+    # bump, so two runs of the same protocol compared as differing for a reason
+    # that had nothing to do with how they were collected. Exact equality: a
+    # digest either is the same string or it is not.
+    baseline = protocol.fingerprint()
+    monkeypatch.setattr(records_module, "SCHEMA_VERSION", version)
+    assert records_module.SCHEMA_VERSION == version
+    assert protocol.fingerprint() == baseline
+
+
+def test_the_schema_version_is_still_written_into_serialized_output() -> None:
+    # Removed from the digest, kept in the output: there it says what wrote the
+    # file, which is exactly what a reader of a serialized result needs.
+    from robostats.compare import compare
+
+    paired = pair(
+        RecordSet([record("pi_zero", "s0"), record("pi_zero", "s1", success=False)]),
+        RecordSet([record("octo", "s0", success=False), record("octo", "s1", success=False)]),
+    )
+    assert compare(paired).schema_version == SCHEMA_VERSION
 
 
 def test_fingerprint_is_hex_digest_and_repeatable() -> None:
@@ -561,3 +606,79 @@ def test_pair_keeps_the_policy_ids_in_the_order_the_sides_were_given() -> None:
     b = RecordSet([record("octo", "s0", success=False)])
     assert (pair(a, b).policy_id_a, pair(a, b).policy_id_b) == ("pi_zero", "octo")
     assert (pair(b, a).policy_id_a, pair(b, a).policy_id_b) == ("octo", "pi_zero")
+
+
+# --------------------------------------------------------------------------------------
+# Join-key provenance
+# --------------------------------------------------------------------------------------
+
+
+def spec_set(policy: str, spec: tuple[str, ...] | None, success: bool = True) -> RecordSet:
+    """A two-scenario set whose keys were composed from ``spec``."""
+    return RecordSet(
+        [record(policy, "s0", success=success), record(policy, "s1", success=success)],
+        scenario_spec=spec,
+    )
+
+
+def test_a_directly_built_record_set_records_no_composition() -> None:
+    # The package cannot inspect how a caller built their keys, and says so
+    # rather than guessing.
+    assert RecordSet([record("p", "s0")]).scenario_spec is None
+
+
+def test_a_record_set_carries_the_composition_it_was_given() -> None:
+    assert spec_set("p", ("task", "seed")).scenario_spec == ("task", "seed")
+
+
+def test_filtering_preserves_the_composition() -> None:
+    # A filtered set holds the same keys, built the same way.
+    original = spec_set("p", ("task", "seed"))
+    assert original.filter(policy_id="p").scenario_spec == ("task", "seed")
+
+
+def test_pair_carries_both_compositions_onto_the_result() -> None:
+    matched = pair(spec_set("a", ("task", "seed")), spec_set("b", ("task", "seed"), success=False))
+    assert matched.scenario_spec_a == ("task", "seed")
+    assert matched.scenario_spec_b == ("task", "seed")
+
+
+def test_pair_refuses_two_sides_composed_from_different_fields() -> None:
+    with pytest.raises(ScenarioSpecMismatchError) as caught:
+        pair(spec_set("a", ("seed",)), spec_set("b", ("layout_id",), success=False))
+    message = str(caught.value)
+    assert "'seed'" in message
+    assert "'layout_id'" in message
+
+
+def test_pair_refuses_when_the_order_differs() -> None:
+    # "task/17" and "17/task" are different strings, but a set composed
+    # (task, seed) and one composed (seed, task) are not the same key space and
+    # a collision between them would be an accident.
+    with pytest.raises(ScenarioSpecMismatchError):
+        pair(spec_set("a", ("task", "seed")), spec_set("b", ("seed", "task"), success=False))
+
+
+def test_pair_accepts_two_sides_composed_the_same_way() -> None:
+    matched = pair(spec_set("a", ("task", "seed")), spec_set("b", ("task", "seed"), success=False))
+    assert matched.n_pairs == 2
+
+
+@pytest.mark.parametrize(
+    ("spec_a", "spec_b"),
+    [(None, ("seed",)), (("seed",), None), (None, None)],
+)
+def test_an_unrecorded_composition_on_either_side_does_not_raise(
+    spec_a: tuple[str, ...] | None, spec_b: tuple[str, ...] | None
+) -> None:
+    # Directly constructed records are legitimate, and the package cannot check
+    # what it was not told. It refuses only when both sides recorded a
+    # composition and the two disagree.
+    matched = pair(spec_set("a", spec_a), spec_set("b", spec_b, success=False))
+    assert matched.scenario_spec_a == spec_a
+    assert matched.scenario_spec_b == spec_b
+
+
+def test_the_spec_mismatch_error_is_a_robostats_error() -> None:
+    with pytest.raises(RobostatsError):
+        pair(spec_set("a", ("seed",)), spec_set("b", ("layout_id",), success=False))

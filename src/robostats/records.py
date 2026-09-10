@@ -21,12 +21,14 @@ from robostats.errors import (
     EmptyRecordSetError,
     MissingScenarioIdError,
     MixedPolicyError,
+    ScenarioSpecMismatchError,
     SchemaError,
 )
 
 __all__ = [
     "SCHEMA_VERSION",
     "EpisodeRecord",
+    "LoadProvenance",
     "PairedResult",
     "Protocol",
     "RecordSet",
@@ -73,13 +75,20 @@ class Protocol:
         ``1.0``, ``"1"`` and ``True`` do not collide. It is stable across
         processes and runs, unlike :func:`hash`, which is salted per process.
 
+        :data:`SCHEMA_VERSION` is deliberately not part of the payload. The
+        question a fingerprint answers is whether two runs were configured the
+        same way, not whether they were also recorded by the same version of
+        this package. Including it would make every fingerprint change on a
+        schema bump, so two runs of the same protocol would compare as differing
+        for a reason that has nothing to do with how they were collected. The
+        version belongs in serialized output, where it says what wrote the file.
+
         Returns
         -------
         str
             A 64-character lowercase hex digest.
         """
         payload = {
-            "schema_version": SCHEMA_VERSION,
             "execution_horizon": _tagged(self.execution_horizon),
             "reset_mode": _tagged(self.reset_mode),
             "max_steps": _tagged(self.max_steps),
@@ -92,6 +101,37 @@ class Protocol:
 def _tagged(value: object) -> list[object]:
     """Return ``value`` paired with its type name, so unlike types never collide."""
     return [type(value).__name__, value]
+
+
+@dataclass(frozen=True, slots=True)
+class LoadProvenance:
+    """What a loader knows about a set of records beyond the records themselves.
+
+    Carried so a report can state it. None of it changes a statistic; all of it
+    changes how a reader should weigh one.
+
+    Parameters
+    ----------
+    preset : str or None
+        Name of the benchmark preset that produced the mapping, if one was used.
+    preset_version : str or None
+        Version of that preset, so a mapping that has gone stale is traceable
+        rather than mysterious.
+    excluded : Mapping[str, int]
+        Counts of episodes the source did not include, keyed by whatever the
+        source called them. A success rate whose denominator excludes abandoned
+        episodes is a different claim from one that does not, and the difference
+        is invisible in the records themselves. The package carries the counts,
+        states them, and adjusts nothing.
+    """
+
+    preset: str | None = None
+    preset_version: str | None = None
+    excluded: Mapping[str, int] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        """Whether anything was recorded at all."""
+        return bool(self.preset or self.excluded)
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,6 +219,14 @@ class RecordSet:
     ----------
     records : Iterable[EpisodeRecord]
         The records to hold. May be empty.
+    scenario_spec : tuple of str, or None
+        The ordered field names a loader composed ``scenario_id`` from. ``None``
+        when the records were built directly, which the package cannot inspect.
+        It is provenance, not identity: it says how the join key was made, so
+        that two sides built differently can be refused rather than joined.
+    provenance : LoadProvenance or None
+        What the loader knows beyond the records: which preset produced the
+        mapping, and how many episodes the source left out.
 
     Raises
     ------
@@ -186,9 +234,16 @@ class RecordSet:
         If any element is not an :class:`EpisodeRecord`.
     """
 
-    __slots__ = ("_records",)
+    __slots__ = ("_provenance", "_records", "_scenario_spec")
 
-    def __init__(self, records: Iterable[EpisodeRecord]) -> None:
+    def __init__(
+        self,
+        records: Iterable[EpisodeRecord],
+        scenario_spec: tuple[str, ...] | None = None,
+        provenance: LoadProvenance | None = None,
+    ) -> None:
+        self._scenario_spec = scenario_spec
+        self._provenance = provenance
         held = tuple(records)
         for position, record in enumerate(held):
             if not isinstance(record, EpisodeRecord):
@@ -202,6 +257,16 @@ class RecordSet:
     def records(self) -> tuple[EpisodeRecord, ...]:
         """The held records, in input order."""
         return self._records
+
+    @property
+    def scenario_spec(self) -> tuple[str, ...] | None:
+        """The fields ``scenario_id`` was composed from, or ``None`` if unrecorded."""
+        return self._scenario_spec
+
+    @property
+    def provenance(self) -> LoadProvenance | None:
+        """What the loader recorded about this set, or ``None`` if built directly."""
+        return self._provenance
 
     def __len__(self) -> int:
         return len(self._records)
@@ -241,10 +306,14 @@ class RecordSet:
             A new set, possibly empty. This set is unchanged.
         """
         return RecordSet(
-            record
-            for record in self._records
-            if (policy_id is None or record.policy_id == policy_id)
-            and (task_id is None or record.task_id == task_id)
+            (
+                record
+                for record in self._records
+                if (policy_id is None or record.policy_id == policy_id)
+                and (task_id is None or record.task_id == task_id)
+            ),
+            scenario_spec=self._scenario_spec,
+            provenance=self._provenance,
         )
 
     def success_count(self) -> int:
@@ -336,6 +405,13 @@ class PairedResult:
         Sorted distinct protocol fingerprints present in ``b``.
     replicates : str
         The replicate policy the join was performed under.
+    scenario_spec_a, scenario_spec_b : tuple of str, or None
+        The fields each side composed its ``scenario_id`` values from, carried
+        through so a report can state what the join was actually on. ``None``
+        where the records were built directly rather than loaded.
+    provenance_a, provenance_b : LoadProvenance or None
+        What each side's loader recorded: the preset that produced the mapping,
+        and the episodes the source left out.
 
     Raises
     ------
@@ -358,6 +434,13 @@ class PairedResult:
     protocol_fingerprints_a: tuple[str, ...]
     protocol_fingerprints_b: tuple[str, ...]
     replicates: str
+    # Default None, like RecordSet.scenario_spec: a table built directly rather
+    # than by pair() has no recorded composition, and that is a legitimate state
+    # rather than something every caller must fill in.
+    scenario_spec_a: tuple[str, ...] | None = None
+    scenario_spec_b: tuple[str, ...] | None = None
+    provenance_a: LoadProvenance | None = None
+    provenance_b: LoadProvenance | None = None
 
     def __post_init__(self) -> None:
         if self.n_pairs == 0:
@@ -425,6 +508,13 @@ def pair(
     MixedPolicyError
         If either set holds more than one distinct ``policy_id``. Checked before
         ``replicates`` is applied.
+    ScenarioSpecMismatchError
+        If both sides recorded how they composed ``scenario_id`` and the two
+        compositions differ. Keys built from different fields are not comparable
+        even when the strings match, so joining them would pair unrelated
+        scenarios silently. A side whose composition is unrecorded does not
+        raise: directly constructed records are legitimate and cannot be
+        checked.
     DuplicateScenarioError
         If ``replicates="strict"`` and a ``scenario_id`` repeats within a set.
     NotImplementedError
@@ -441,6 +531,7 @@ def pair(
     # silently resolves a set that holds two policies.
     policy_id_a = _require_single_policy(a, "a")
     policy_id_b = _require_single_policy(b, "b")
+    _require_comparable_scenario_specs(a, b)
 
     if replicates == "mean":
         raise NotImplementedError(
@@ -480,6 +571,10 @@ def pair(
         dropped_from_b=len(outcomes_b) - len(matched),
         protocol_fingerprints_a=a.protocol_fingerprints(),
         protocol_fingerprints_b=b.protocol_fingerprints(),
+        scenario_spec_a=a.scenario_spec,
+        scenario_spec_b=b.scenario_spec,
+        provenance_a=a.provenance,
+        provenance_b=b.provenance,
         replicates=replicates,
     )
 
@@ -502,6 +597,23 @@ def _require_scenario_ids(a: RecordSet, b: RecordSet) -> None:
     more = "" if len(offenders) <= _MAX_REPORTED else f", and {len(offenders) - _MAX_REPORTED} more"
     raise MissingScenarioIdError(
         f"pair() joins on scenario_id, but {len(offenders)} record(s) lack one: {shown}{more}"
+    )
+
+
+def _require_comparable_scenario_specs(a: RecordSet, b: RecordSet) -> None:
+    """Raise if both sides recorded a ``scenario_id`` composition and they differ."""
+    spec_a = a.scenario_spec
+    spec_b = b.scenario_spec
+    if spec_a is None or spec_b is None or spec_a == spec_b:
+        return
+    raise ScenarioSpecMismatchError(
+        f"the two sides composed scenario_id from different fields, so their keys are "
+        f"not comparable: a used {' / '.join(spec_a)} ({spec_a!r}) and b used "
+        f"{' / '.join(spec_b)} ({spec_b!r}). Identical strings from these two "
+        f"compositions do not refer to the same scenario, so joining on them would "
+        f"pair unrelated episodes and report a plausible, wrong difference. Recompose "
+        f"one side to match the other, or pass record sets whose composition is not "
+        f"recorded if you have checked the keys yourself."
     )
 
 

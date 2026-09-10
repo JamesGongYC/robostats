@@ -14,8 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from robostats.errors import LoadError, MissingScenarioIdError, RobostatsError
-from robostats.io import load_csv, load_jsonl
+from robostats.errors import (
+    LoadError,
+    MissingScenarioIdError,
+    RobostatsError,
+    ScenarioSpecMismatchError,
+)
+from robostats.io import load_csv, load_jsonl, load_manifest
 from robostats.records import EpisodeRecord, Protocol, RecordSet, pair
 
 PROTOCOL = Protocol(execution_horizon=8, reset_mode="fixed", max_steps=300, extra={"suite": "demo"})
@@ -537,3 +542,517 @@ def test_a_mapped_score_column_must_exist(tmp_path: Path) -> None:
     path = write_csv(tmp_path / "a.csv", csv_rows(ROWS))
     with pytest.raises(LoadError, match=r"missing mapped column\(s\) 'score'"):
         load_csv(path, protocol=PROTOCOL, **MAPPING, success_detail_field="score")
+
+
+# --------------------------------------------------------------------------------------
+# Literal alternatives to a mapped field
+# --------------------------------------------------------------------------------------
+
+
+def test_a_literal_and_a_mapped_field_produce_the_same_records(tmp_path: Path) -> None:
+    # RoboTwin's policy name exists only as a directory component, with no column
+    # to map, so the caller supplies it directly. The result must be identical to
+    # having read it from the data.
+    rows = [{**row, "policy": "pi_zero"} for row in ROWS]
+    from_field = load_jsonl(write_jsonl(tmp_path / "a.jsonl", rows), protocol=PROTOCOL, **MAPPING)
+
+    without_policy = [{key: value for key, value in row.items() if key != "policy"} for row in rows]
+    mapping = {**MAPPING, "policy_id_field": None}
+    from_literal = load_jsonl(
+        write_jsonl(tmp_path / "b.jsonl", without_policy),
+        protocol=PROTOCOL,
+        policy_id="pi_zero",
+        **mapping,
+    )
+    assert from_literal.records == from_field.records
+
+
+def test_a_literal_task_id_and_run_id_are_accepted(tmp_path: Path) -> None:
+    rows = [
+        {key: value for key, value in row.items() if key not in {"task", "run"}} for row in ROWS
+    ]
+    for row, original in zip(rows, ROWS, strict=True):
+        row["scenario"] = f"{original['task']}/{original['init']}"
+    path = write_jsonl(tmp_path / "a.jsonl", rows)
+    loaded = load_jsonl(
+        path,
+        protocol=PROTOCOL,
+        policy_id_field="policy",
+        task_id="put_bowl",
+        success_field="success",
+        scenario_fields=("scenario",),
+        run_id="run_a",
+    )
+    assert {record.task_id for record in loaded} == {"put_bowl"}
+    assert {record.run_id for record in loaded} == {"run_a"}
+
+
+@pytest.mark.parametrize(
+    ("field", "kwargs"),
+    [
+        ("policy_id", {"policy_id": "pi_zero", "policy_id_field": "policy"}),
+        ("task_id", {"task_id": "put_bowl", "task_id_field": "task"}),
+        ("run_id", {"run_id": "run_a", "run_id_field": "run"}),
+    ],
+)
+def test_supplying_both_a_literal_and_a_field_is_an_error(
+    tmp_path: Path, field: str, kwargs: dict[str, str]
+) -> None:
+    path = write_jsonl(tmp_path / "a.jsonl", ROWS)
+    base = {**MAPPING}
+    base.pop(f"{field}_field", None)
+    with pytest.raises(LoadError) as caught:
+        load_jsonl(path, protocol=PROTOCOL, **{**base, **kwargs})
+    message = str(caught.value)
+    assert f"{field!r}" in message
+    assert "does not decide which wins" in message
+
+
+@pytest.mark.parametrize("field", ["policy_id", "task_id"])
+def test_supplying_neither_a_literal_nor_a_field_is_a_type_error(
+    tmp_path: Path, field: str
+) -> None:
+    path = write_jsonl(tmp_path / "a.jsonl", ROWS)
+    mapping = {**MAPPING, f"{field}_field": None}
+    with pytest.raises(TypeError, match=f"{field} is required"):
+        load_jsonl(path, protocol=PROTOCOL, **mapping)
+
+
+def test_literals_work_for_csv_too(tmp_path: Path) -> None:
+    rows = [{key: value for key, value in row.items() if key != "policy"} for row in csv_rows(ROWS)]
+    path = write_csv(tmp_path / "a.csv", rows)
+    loaded = load_csv(
+        path, protocol=PROTOCOL, policy_id="pi_zero", **{**MAPPING, "policy_id_field": None}
+    )
+    assert {record.policy_id for record in loaded} == {"pi_zero"}
+
+
+# --------------------------------------------------------------------------------------
+# Nested manifests
+# --------------------------------------------------------------------------------------
+
+EPISODES = [
+    {"task": "put_bowl", "init": 17, "success": True, "episode": 0},
+    {"task": "put_bowl", "init": 18, "success": False, "episode": 1},
+    {"task": "open_drawer", "init": 3, "success": True, "episode": 2},
+]
+
+MANIFEST_MAPPING = {
+    "policy_id_field": "policy",
+    "task_id_field": "task",
+    "success_field": "success",
+    "scenario_fields": ("task", "init"),
+    "episode_idx_field": "episode",
+}
+
+
+def write_manifest(path: Path, document: dict[str, object]) -> Path:
+    """Write a JSON document and return the path."""
+    path.write_text(json.dumps(document))
+    return path
+
+
+def test_manifest_hoists_run_level_fields_onto_every_episode(tmp_path: Path) -> None:
+    path = write_manifest(
+        tmp_path / "run.json",
+        {"policy": "pi_zero", "results": {"episodes": EPISODES}},
+    )
+    loaded = load_manifest(
+        path,
+        protocol=PROTOCOL,
+        episodes_at="results.episodes",
+        run_fields=("policy",),
+        **MANIFEST_MAPPING,
+    )
+    assert [record.policy_id for record in loaded] == ["pi_zero"] * 3
+    assert [record.scenario_id for record in loaded] == [
+        "put_bowl/17",
+        "put_bowl/18",
+        "open_drawer/3",
+    ]
+    assert [record.success for record in loaded] == [True, False, True]
+
+
+def test_a_list_and_a_mapping_of_episodes_load_identically(tmp_path: Path) -> None:
+    # A mapping's keys are positional, and positional identity is not scenario
+    # identity, so they are ignored rather than used.
+    as_list = write_manifest(tmp_path / "list.json", {"policy": "pi_zero", "episodes": EPISODES})
+    as_mapping = write_manifest(
+        tmp_path / "map.json",
+        {
+            "policy": "pi_zero",
+            "episodes": {str(index): episode for index, episode in enumerate(EPISODES)},
+        },
+    )
+    kwargs = {"protocol": PROTOCOL, "episodes_at": "episodes", "run_fields": ("policy",)}
+    from_list = load_manifest(as_list, **kwargs, **MANIFEST_MAPPING)
+    from_mapping = load_manifest(as_mapping, **kwargs, **MANIFEST_MAPPING)
+    assert from_list.records == from_mapping.records
+    assert from_list.scenario_spec == from_mapping.scenario_spec
+
+
+def test_a_dotted_episodes_path_resolves_through_nesting(tmp_path: Path) -> None:
+    path = write_manifest(
+        tmp_path / "run.json",
+        {"policy": "pi_zero", "eval": {"run": {"episodes": EPISODES}}},
+    )
+    loaded = load_manifest(
+        path,
+        protocol=PROTOCOL,
+        episodes_at="eval.run.episodes",
+        run_fields=("policy",),
+        **MANIFEST_MAPPING,
+    )
+    assert len(loaded) == 3
+
+
+def test_a_missing_episodes_path_names_the_path_and_the_keys(tmp_path: Path) -> None:
+    path = write_manifest(
+        tmp_path / "run.json", {"policy": "pi_zero", "results": {"rollouts": EPISODES}}
+    )
+    with pytest.raises(LoadError) as caught:
+        load_manifest(
+            path,
+            protocol=PROTOCOL,
+            episodes_at="results.episodes",
+            run_fields=("policy",),
+            **MANIFEST_MAPPING,
+        )
+    message = str(caught.value)
+    assert "results.episodes" in message
+    assert "'rollouts'" in message
+    assert "never" in message and "guessed" in message
+
+
+def test_a_field_named_in_both_run_fields_and_the_episodes_is_an_error(tmp_path: Path) -> None:
+    # The loader does not decide which value wins.
+    episodes = [{**episode, "policy": "octo"} for episode in EPISODES]
+    path = write_manifest(tmp_path / "run.json", {"policy": "pi_zero", "episodes": episodes})
+    with pytest.raises(LoadError) as caught:
+        load_manifest(
+            path,
+            protocol=PROTOCOL,
+            episodes_at="episodes",
+            run_fields=("policy",),
+            **MANIFEST_MAPPING,
+        )
+    message = str(caught.value)
+    assert "episode 0" in message
+    assert "'policy'" in message
+    assert "does not decide which value wins" in message
+
+
+def test_a_run_field_absent_from_the_document_is_an_error(tmp_path: Path) -> None:
+    path = write_manifest(tmp_path / "run.json", {"policy": "pi_zero", "episodes": EPISODES})
+    with pytest.raises(LoadError, match="run_fields names 'seed_base'"):
+        load_manifest(
+            path,
+            protocol=PROTOCOL,
+            episodes_at="episodes",
+            run_fields=("policy", "seed_base"),
+            **MANIFEST_MAPPING,
+        )
+
+
+def test_an_empty_episode_collection_is_an_error(tmp_path: Path) -> None:
+    path = write_manifest(tmp_path / "run.json", {"policy": "pi_zero", "episodes": []})
+    with pytest.raises(LoadError, match="is empty; expected at least one episode"):
+        load_manifest(
+            path,
+            protocol=PROTOCOL,
+            episodes_at="episodes",
+            run_fields=("policy",),
+            **MANIFEST_MAPPING,
+        )
+
+
+def test_an_episode_that_is_not_an_object_names_its_index(tmp_path: Path) -> None:
+    path = write_manifest(
+        tmp_path / "run.json", {"policy": "pi_zero", "episodes": [EPISODES[0], [1, 2]]}
+    )
+    with pytest.raises(LoadError, match="episode 1: expected a JSON object, got list"):
+        load_manifest(
+            path,
+            protocol=PROTOCOL,
+            episodes_at="episodes",
+            run_fields=("policy",),
+            **MANIFEST_MAPPING,
+        )
+
+
+def test_a_manifest_that_is_not_an_object_is_an_error(tmp_path: Path) -> None:
+    path = tmp_path / "run.json"
+    path.write_text(json.dumps(EPISODES))
+    with pytest.raises(LoadError, match="expected a JSON object, got list"):
+        load_manifest(
+            path, protocol=PROTOCOL, episodes_at="episodes", policy_id="p", **{
+                key: value for key, value in MANIFEST_MAPPING.items() if key != "policy_id_field"
+            }
+        )
+
+
+def test_the_manifest_loader_does_not_read_the_protocol_from_the_document(tmp_path: Path) -> None:
+    lie = Protocol(execution_horizon=1, reset_mode="from_file")
+    path = write_manifest(
+        tmp_path / "run.json",
+        {"policy": "pi_zero", "execution_horizon": 1, "episodes": EPISODES},
+    )
+    loaded = load_manifest(
+        path,
+        protocol=PROTOCOL,
+        episodes_at="episodes",
+        run_fields=("policy",),
+        **MANIFEST_MAPPING,
+    )
+    assert loaded.protocol_fingerprints() == (PROTOCOL.fingerprint(),)
+    assert loaded.protocol_fingerprints() != (lie.fingerprint(),)
+
+
+# --------------------------------------------------------------------------------------
+# The join key's composition is recorded
+# --------------------------------------------------------------------------------------
+
+
+def test_each_loader_records_the_scenario_composition(tmp_path: Path) -> None:
+    expected = ("task", "init")
+    from_jsonl = load_jsonl(write_jsonl(tmp_path / "a.jsonl", ROWS), protocol=PROTOCOL, **MAPPING)
+    from_csv = load_csv(
+        write_csv(tmp_path / "a.csv", csv_rows(ROWS)), protocol=PROTOCOL, **MAPPING
+    )
+    from_manifest = load_manifest(
+        write_manifest(tmp_path / "a.json", {"policy": "pi_zero", "episodes": EPISODES}),
+        protocol=PROTOCOL,
+        episodes_at="episodes",
+        run_fields=("policy",),
+        **MANIFEST_MAPPING,
+    )
+    # Exact: a spec is a tuple of strings, so equality is equality.
+    for loaded in (from_jsonl, from_csv, from_manifest):
+        assert loaded.scenario_spec == expected
+
+
+def test_composing_nothing_records_no_spec(tmp_path: Path) -> None:
+    loaded = load_jsonl(
+        write_jsonl(tmp_path / "a.jsonl", ROWS),
+        protocol=PROTOCOL,
+        **{**MAPPING, "scenario_fields": ()},
+    )
+    assert loaded.scenario_spec is None
+    assert all(record.scenario_id is None for record in loaded)
+
+
+def test_the_spec_follows_the_order_the_caller_gave(tmp_path: Path) -> None:
+    path = write_jsonl(tmp_path / "a.jsonl", ROWS)
+    reversed_ = load_jsonl(
+        path, protocol=PROTOCOL, **{**MAPPING, "scenario_fields": ("init", "task")}
+    )
+    assert reversed_.scenario_spec == ("init", "task")
+
+
+# --------------------------------------------------------------------------------------
+# The hazard this provenance exists for
+# --------------------------------------------------------------------------------------
+
+
+def test_keys_that_collide_but_were_built_differently_are_refused(tmp_path: Path) -> None:
+    """Two runs, three scenarios each, and a join that would look perfect.
+
+    The first harness identified a scenario by its seed. The second identified it
+    by its layout id. Both wrote the values 17, 18 and 19, so both files produce
+    the scenario ids "17", "18" and "19": every key matches, nothing is dropped,
+    and the comparison would report a confident difference between episodes that
+    have nothing to do with each other.
+
+    No amount of looking at the keys reveals this, because the keys are correct.
+    The only thing that distinguishes the two sides is what went into them, which
+    is why the loader records it and pair() refuses when the two disagree.
+    """
+    by_seed = [
+        {"policy": "pi_zero", "task": "put_bowl", "seed": value, "success": True}
+        for value in (17, 18, 19)
+    ]
+    by_layout = [
+        {"policy": "octo", "task": "put_bowl", "layout_id": value, "success": False}
+        for value in (17, 18, 19)
+    ]
+    a = load_jsonl(
+        write_jsonl(tmp_path / "seeded.jsonl", by_seed),
+        protocol=PROTOCOL,
+        policy_id_field="policy",
+        task_id_field="task",
+        success_field="success",
+        scenario_fields=("seed",),
+    )
+    b = load_jsonl(
+        write_jsonl(tmp_path / "layouts.jsonl", by_layout),
+        protocol=PROTOCOL,
+        policy_id_field="policy",
+        task_id_field="task",
+        success_field="success",
+        scenario_fields=("layout_id",),
+    )
+
+    # The keys really do collide: this is what makes the failure invisible.
+    assert [record.scenario_id for record in a] == ["17", "18", "19"]
+    assert [record.scenario_id for record in b] == ["17", "18", "19"]
+
+    with pytest.raises(ScenarioSpecMismatchError) as caught:
+        pair(a, b)
+    message = str(caught.value)
+    assert "seed" in message
+    assert "layout_id" in message
+    assert "not comparable" in message
+
+
+# --------------------------------------------------------------------------------------
+# Literal components in the join key
+# --------------------------------------------------------------------------------------
+
+
+def test_a_literal_prefix_leads_the_composed_key(tmp_path: Path) -> None:
+    # The position is defined by the call: literals first, in the order given,
+    # then the field-derived components.
+    loaded = load_jsonl(
+        write_jsonl(tmp_path / "a.jsonl", ROWS),
+        protocol=PROTOCOL,
+        **{**MAPPING, "scenario_prefix": ("demo_clean",)},
+    )
+    assert [record.scenario_id for record in loaded] == [
+        "demo_clean/put_bowl/17",
+        "demo_clean/put_bowl/18",
+        "demo_clean/open_drawer/3",
+    ]
+
+
+def test_several_literals_keep_their_order(tmp_path: Path) -> None:
+    loaded = load_jsonl(
+        write_jsonl(tmp_path / "a.jsonl", ROWS),
+        protocol=PROTOCOL,
+        **{**MAPPING, "scenario_prefix": ("robotwin", "demo_clean")},
+    )
+    assert loaded.records[0].scenario_id == "robotwin/demo_clean/put_bowl/17"
+    assert loaded.scenario_spec == ("'robotwin'", "'demo_clean'", "task", "init")
+
+
+def test_the_spec_distinguishes_a_literal_from_a_field(tmp_path: Path) -> None:
+    # A spec entry has to say which kind of component it was, because the report
+    # and the mismatch check read this tuple and nothing else.
+    loaded = load_jsonl(
+        write_jsonl(tmp_path / "a.jsonl", ROWS),
+        protocol=PROTOCOL,
+        **{**MAPPING, "scenario_prefix": ("demo_clean",)},
+    )
+    assert loaded.scenario_spec == ("'demo_clean'", "task", "init")
+    # A file with a column actually named task is indistinguishable from one
+    # whose literal happened to be the word task only if quoting is dropped.
+    literal_task = load_jsonl(
+        write_jsonl(tmp_path / "b.jsonl", ROWS),
+        protocol=PROTOCOL,
+        **{**MAPPING, "scenario_prefix": ("task",)},
+    )
+    assert literal_task.scenario_spec == ("'task'", "task", "init")
+
+
+@pytest.mark.parametrize("loader", ["jsonl", "csv", "manifest"])
+def test_every_loader_takes_a_literal_prefix(tmp_path: Path, loader: str) -> None:
+    if loader == "jsonl":
+        loaded = load_jsonl(
+            write_jsonl(tmp_path / "a.jsonl", ROWS),
+            protocol=PROTOCOL,
+            **{**MAPPING, "scenario_prefix": ("demo_clean",)},
+        )
+    elif loader == "csv":
+        loaded = load_csv(
+            write_csv(tmp_path / "a.csv", csv_rows(ROWS)),
+            protocol=PROTOCOL,
+            **{**MAPPING, "scenario_prefix": ("demo_clean",)},
+        )
+    else:
+        loaded = load_manifest(
+            write_manifest(tmp_path / "a.json", {"policy": "pi_zero", "episodes": EPISODES}),
+            protocol=PROTOCOL,
+            episodes_at="episodes",
+            run_fields=("policy",),
+            scenario_prefix=("demo_clean",),
+            **MANIFEST_MAPPING,
+        )
+    assert loaded.scenario_spec == ("'demo_clean'", "task", "init")
+    assert loaded.records[0].scenario_id.startswith("demo_clean/")
+
+
+def test_a_prefix_without_fields_is_refused(tmp_path: Path) -> None:
+    # A constant is the same on every record, so it cannot identify a scenario:
+    # every episode would receive one key.
+    with pytest.raises(LoadError, match="cannot identify a scenario on its own"):
+        load_jsonl(
+            write_jsonl(tmp_path / "a.jsonl", ROWS),
+            protocol=PROTOCOL,
+            **{**MAPPING, "scenario_fields": (), "scenario_prefix": ("demo_clean",)},
+        )
+
+
+def test_different_configurations_stop_the_keys_colliding(tmp_path: Path) -> None:
+    """The hazard, fixed: the same seeds under two configurations, kept apart.
+
+    RoboTwin's ``task_config`` selects ``demo_clean`` or ``demo_randomized``, and
+    it exists only as a directory component, so there is no column to name. Seed
+    17 under one configuration is a different scene from seed 17 under the other.
+
+    Without the literal, both runs compose "put_bowl/17" and the join is silently
+    wrong. With it, the keys differ, so no scenario matches and the join fails
+    loudly instead. The specs differ too, so the refusal names the cause rather
+    than reporting an empty overlap.
+    """
+    rows = [
+        {"policy": "pi_zero", "task": "put_bowl", "seed": seed, "success": True}
+        for seed in (17, 18, 19)
+    ]
+    shared = {
+        "protocol": PROTOCOL,
+        "policy_id_field": "policy",
+        "task_id_field": "task",
+        "success_field": "success",
+        "scenario_fields": ("task", "seed"),
+    }
+    clean = load_jsonl(
+        write_jsonl(tmp_path / "clean.jsonl", rows), scenario_prefix=("demo_clean",), **shared
+    )
+    randomized = load_jsonl(
+        write_jsonl(tmp_path / "random.jsonl", [{**row, "policy": "octo"} for row in rows]),
+        scenario_prefix=("demo_randomized",),
+        **shared,
+    )
+
+    assert clean.records[0].scenario_id == "demo_clean/put_bowl/17"
+    assert randomized.records[0].scenario_id == "demo_randomized/put_bowl/17"
+    assert clean.records[0].scenario_id != randomized.records[0].scenario_id
+
+    with pytest.raises(ScenarioSpecMismatchError) as caught:
+        pair(clean, randomized)
+    message = str(caught.value)
+    assert "'demo_clean'" in message
+    assert "'demo_randomized'" in message
+
+
+def test_the_same_configuration_on_both_sides_joins_normally(tmp_path: Path) -> None:
+    rows = [
+        {"policy": "pi_zero", "task": "put_bowl", "seed": seed, "success": True}
+        for seed in (17, 18, 19)
+    ]
+    shared = {
+        "protocol": PROTOCOL,
+        "task_id_field": "task",
+        "success_field": "success",
+        "scenario_fields": ("task", "seed"),
+        "scenario_prefix": ("demo_clean",),
+    }
+    a = load_jsonl(write_jsonl(tmp_path / "a.jsonl", rows), policy_id="pi_zero", **shared)
+    b = load_jsonl(
+        write_jsonl(tmp_path / "b.jsonl", [{**row, "success": False} for row in rows]),
+        policy_id="octo",
+        **shared,
+    )
+    matched = pair(a, b)
+    assert matched.n_pairs == 3
+    assert matched.scenario_spec_a == ("'demo_clean'", "task", "seed")
+    assert matched.scenario_spec_b == matched.scenario_spec_a
