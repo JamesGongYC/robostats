@@ -5,6 +5,7 @@ description = "Statistics and uncertainty quantification for robot policy evalua
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24", "scipy>=1.11"]
+license = "Apache-2.0"
 
 [project.optional-dependencies]
 vla-eval = []

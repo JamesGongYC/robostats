@@ -25,7 +25,14 @@ Do not add code that:
   core runtime path
 - performs evaluation orchestration, scheduling, or sharding
 
-Reading another tool's output files is in scope. Producing those files is not.
+Reading another tool's output files is in scope.
+
+Recording is in scope. The package may write episode records, because it cannot
+compute honest statistics on data that was never persisted, and two of the three
+surveyed benchmarks discard per-episode outcomes before writing. Recording
+remains bounded: no environment is stepped, no policy is loaded, no rollout is
+run. The recorder is a writer called by user code, never a runner.
+
 If a task seems to require any of the above, stop and say so rather than
 building it.
 
@@ -173,3 +180,5 @@ catch, so it is never the silent default.
 - Line length 100.
 
 Numbers quoted in a brief or a prompt are measurements, not specifications. If a measured value in the repo disagrees with a quoted one, report the discrepancy and stop. Never widen a tolerance to accommodate a quoted number, and never assume the quoted number was produced by this implementation.
+
+Never run git commit, git push, git tag, or any other command that writes to history or a remote. Staging and committing are the user's, always. Report what changed and leave the working tree for review. git status, git diff, and git log are fine.
