@@ -1,0 +1,13 @@
+# schema_version: 2
+# interval_only: the interval excludes 0 while the test does not reject.
+# test_only: the test rejects while the interval contains 0.
+mode,confidence,tables,disagreements,rate,interval_only,test_only
+paired,0.9,7513,634,0.084387062425,634,0
+unpaired-score,0.9,3969,0,0.0,0,0
+unpaired-exact,0.9,3969,236,0.059460821366,236,0
+paired,0.95,7513,526,0.070011979236,526,0
+unpaired-score,0.95,3969,0,0.0,0,0
+unpaired-exact,0.95,3969,182,0.045855379189,182,0
+paired,0.99,7513,286,0.038067349927,286,0
+unpaired-score,0.99,3969,0,0.0,0,0
+unpaired-exact,0.99,3969,106,0.026706979088,106,0

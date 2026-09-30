@@ -1,0 +1,17 @@
+# schema_version: 2
+# part: what the sweep says the threshold should be
+# regret: power given up against choosing the better mode with hindsight.
+# Derived from power.csv, so it carries that Monte Carlo error.
+# decimals: 12
+# rows: 9 of 9
+# sha256_of_full_table: aef083aa3ce9d6c003c141769a3ec05eeb4968ebd17341f0ca69e6dcfd7c2ddb
+threshold,configurations,wrong_choices,mean_regret,worst_regret
+1,108,89,0.239055555556,0.9325
+5,108,89,0.239055555556,0.9325
+10,108,80,0.190787037037,0.863
+15,108,71,0.145388888889,0.6935
+20,108,62,0.10712037037,0.5755
+25,108,53,0.076907407407,0.4725
+30,108,44,0.053199074074,0.3865
+40,108,28,0.023666666667,0.2865
+60,108,18,0.011819444444,0.2025

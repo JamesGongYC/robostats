@@ -1,0 +1,15 @@
+# schema_version: 2
+# sha256 is over the full table, rounded to 12 decimals, serialized as
+#   counts then p_value, lower, upper as repr(float), one row per line,
+#   newline separated with a trailing newline, encoded UTF-8.
+# Regenerate the full tables with: uv run python validation/coherence.py
+mode,confidence,tables,rows_committed,sha256
+paired,0.9,7513,912,aaf90d0dc9037e44e96ab1b886a664d5a046497ad783c079f438eab50e3977b1
+unpaired-score,0.9,3969,300,345478e3578437408f8965af12abd5502565a7ece8ccac60007d28899be9ff0f
+unpaired-exact,0.9,3969,514,f36e6cc5409c9ae22981327b3239cb4110c5911c058dabc9ac7014ecf2cbfd5c
+paired,0.95,7513,804,21008b96621e52166c69fe33332c3189b6470499002f967337b9189e45922d5c
+unpaired-score,0.95,3969,300,e07dae3eb05593fd51fffc7d5f67571e5bf1e244075e4d84ce044b254760e1a4
+unpaired-exact,0.95,3969,468,60849f750f763e142c34c7a0e3c3088ea05d3ac1ae889b5695d1dd828cab4975
+paired,0.99,7513,575,6eb40c0a361eb7bcd4eb144ec9be518f58fe9058af01e0d187413e49e408387e
+unpaired-score,0.99,3969,300,1d98e8106183488b33f64b3a154bad6d67b341536da09bed435a67f580707a9a
+unpaired-exact,0.99,3969,401,1f9773fc742c4bf98678b99ffe251643c276e54f1455d4227a1261d4a2ee601e

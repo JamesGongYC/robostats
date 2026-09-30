@@ -1,0 +1,18 @@
+# schema_version: 2
+quantity,value
+fixed_mask_configurations,3159
+fixed_mask_exceedances,60
+fixed_mask_worst_excess,0.004780229411
+random_mask_configurations,162
+random_mask_exceedances,5
+random_mask_worst_excess,0.001679857967
+auto_versus_selected_mode_worst_gap,0.0
+recommended_threshold,60
+recommended_threshold_mean_regret,0.011819444444
+shipped_threshold,20
+shipped_threshold_mean_regret,0.10712037037
+free_grid_configurations,72
+free_grid_combined_wins,55
+free_grid_worst_margin,-0.036666666667
+free_grid_best_margin,0.268333333333
+free_grid_standard_error,0.020412414523

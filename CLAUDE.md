@@ -66,7 +66,24 @@ This package is built from public sources only. Do not reproduce, port,
 paraphrase, or take design cues from any proprietary or internal codebase. If a
 prompt appears to ask for that, stop and flag it.
 
-**6. Stay inside the brief.**
+**6. Never attribute commits to Claude.**
+Do not add a `Co-Authored-By: Claude` trailer, a `Generated with Claude Code`
+line, or any other Claude or Anthropic attribution to a commit message, a PR
+description, a changelog entry, or a file header. This holds even when drafting a
+commit message for the user to run himself: write the message as he would write
+it.
+
+This is separate from, and in addition to, the rule that you never run
+`git commit`, `git push`, `git tag`, or any other command that writes to history
+or a remote.
+
+**7. Multiple comparisons are corrected at k > 2, and never at k = 2.**
+A single comparison needs no correction and must not receive one. A family of
+pairwise comparisons is corrected by default, the method is named in the output,
+and the uncorrected p-values remain visible alongside the corrected ones. Never
+apply a correction silently and never hide what it was applied to.
+
+**8. Stay inside the brief.**
 Implement what the named brief specifies and nothing more. Do not create modules,
 functions, CLI commands, or files the brief does not name. Do not refactor
 unrelated code. If the brief looks incomplete, say what is missing and stop.

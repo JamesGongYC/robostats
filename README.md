@@ -1,240 +1,161 @@
 # robostats
 
-Statistics and uncertainty quantification for robot policy evaluation.
+A statistics helper for mainstream robotics evaluations, to help your experiments
+be more statistically rigorous.
 
-Robot policy results are usually reported as a single success rate. `robostats`
+Robot policy results are usually reported as a single success rate. robostats
 takes the episode-level records behind that number and returns what the number
-actually supports: an interval, a comparison against another policy that respects
-the shared evaluation scenarios, and a report that states what each run declared
-about how it was collected.
+actually supports: an interval around it, and a comparison against another policy
+that respects how the two were evaluated.
 
-**Status: 0.0.1, early.** The statistical core, ingestion, and reporting work.
-Unpaired comparison, power analysis, and harness-specific adapters do not exist
-yet. See the roadmap.
+**Status: early.** The two-policy path is complete and validated. Comparison
+across more than two policies is not yet implemented; see Roadmap.
 
 ---
 
-## Why this exists
+## Main functions
 
-Four things motivated it. Three are measured and reproducible from this
-repository.
+### Reads and records LIBERO, RoboTwin and RoboDojo experiments
 
-**1. A widely used library reports maximal significance for two identical
-policies.**
+The three benchmarks persist very different things, so robostats meets each where
+it is.
 
-`statsmodels.stats.contingency_tables.mcnemar` with the continuity correction, on
-a table with zero discordant pairs, computes `(|0 - 0| - 1)^2 / 0`. It returns
-`statistic=inf, pvalue=0.0`. Two policies that agreed on every single scenario
-are reported as maximally different. Without the correction the same table
-returns `nan`. `robostats` returns `p = 1.0`.
-
-Details and a minimal reproduction: [`results/statsmodels-mcnemar-m0.md`](results/statsmodels-mcnemar-m0.md).
-
-**2. The default interval method misses its nominal coverage where robot
-policies actually operate.**
-
-The Wilson score interval is the common recommendation for binomial proportions,
-and it is a good one across most of the parameter space. But policy success rates
-cluster near the ceiling, and that is where it degrades. Measured by exact
-enumeration at n = 50 and 95% nominal:
-
-| true success rate | Wilson | Clopper-Pearson |
+| Benchmark | What it writes | What robostats does |
 |---|---|---|
-| 0.92 | 0.9407 | 0.9679 |
-| 0.98 | 0.9216 | 0.9822 |
-| 0.99 | 0.9106 | 0.9862 |
+| **RoboDojo** | per-episode `layout_id`, `success`, `score`, plus a run manifest | reads it directly, no patch needed |
+| **RoboTwin** | a single success fraction in `_result.txt` | records per-episode outcomes through the existing `trial_end` hook, from your own policy adapter |
+| **LIBERO** | a single `success_rate` float | records per-episode outcomes through a short insertion in the eval loop |
 
-Across the whole region `p` in [0.85, 0.99], Wilson's coverage falls to 0.8951.
-A nominal 95% interval delivering 90% is not a rounding issue.
+LIBERO and RoboTwin discard per-episode outcomes before writing anything, so no
+adapter can recover them. See [`docs/recording.md`](docs/recording.md) for both.
 
-**3. The guarantee is cheap.**
+**Output** is a confidence interval for each policy's success rate, and for a
+comparison: an effect size, an interval for it, and a p-value, with the number of
+scenarios matched, dropped or excluded, and whatever each run declared about how
+it was produced. A p-value is never returned without an effect size and its
+uncertainty.
 
-Exactness costs width, and the usual objection to Clopper-Pearson is that it is
-too conservative to be useful. In this operating region that objection does not
-hold up. Expected interval width at n = 50, 95%:
+Presets handle the per-benchmark field mapping and, importantly, compose the
+scenario key correctly. The same `seed` under `demo_clean` and `demo_randomized`
+is a different scene, and joining on the bare seed pairs unrelated episodes
+silently. `describe_preset("robotwin")` shows exactly what a preset will do
+before you trust it.
 
-| method | mean width | mean coverage | min coverage |
-|---|---|---|---|
-| Wilson | 0.1488 | 0.9549 | 0.8951 |
-| Clopper-Pearson | 0.1602 | 0.9773 | 0.9509 |
-| Agresti-Coull | 0.1593 | 0.9684 | 0.9469 |
+### Adapts to overlapping, partially overlapping and non-overlapping scenarios
 
-Clopper-Pearson buys a guarantee that never drops below nominal for about 7.7%
-extra width. Agresti-Coull costs nearly the same width without the guarantee.
+Two policies rarely run the same scenarios. Episodes get skipped at setup,
+abandoned mid-run, and different papers use different subsets. The right test
+depends on which case you are in.
 
-**4. Nothing tells you how the two runs were configured.**
+- **Fully overlapping** — both policies ran the same scenarios. Pairing cancels
+  out scenario difficulty and detects smaller real differences from the same
+  data. McNemar's exact test with Tango's score interval.
+- **Non-overlapping** — nothing shared, so there is nothing to pair. Score test
+  with the Miettinen-Nurminen interval, coherent by construction: the interval
+  excludes zero exactly when the test rejects.
+- **Partially overlapping** — the common case. The shared scenarios and the
+  remainder are both informative, and discarding either loses power. robostats
+  uses all of them.
 
-Evaluation protocol details, the execution horizon in particular, move reported
-success rates substantially. Two runs at different horizons can differ for
-reasons that have nothing to do with the policies, and most published numbers do
-not say which horizon produced them. Nothing in the usual tooling asks.
+`mode="auto"` picks between paired and unpaired from the observation pattern
+alone, never from the outcomes, so the reported p-value keeps the level it
+claims. The chosen mode and the reason appear in the output. `mode="all"` reports
+every applicable mode side by side instead, which is often more useful: when they
+agree you gain confidence cheaply, and when they disagree that is the finding.
 
-`robostats` does not refuse those comparisons. Refusing would be the wrong call:
-an execution horizon is an action-chunk deployment choice, not a property of the
-measurement apparatus, and different policies have different natural chunk sizes,
-so demanding a shared horizon handicaps whichever policy it suits less. Most real
-harness output records none of these fields anyway, so a package that insists on
-them refuses most real data on first use.
+### Adapts to pairwise or multiple model comparisons
 
-What it does instead is record what each side declared and put it in the report,
-every time. Two runs at horizon 8 and horizon 16 fingerprint differently, and the
-report says so without ruling on it:
+**Not yet implemented.** Planned: Cochran's Q across k policies, the set of
+models statistically indistinguishable from the best rather than a ranking, and
+bootstrap rank intervals.
 
-```
-Protocol:      pi_zero  protocol 0ce610a4e6e5
-               octo     protocol a43826bc58d4
-```
-
-and where a run recorded nothing:
-
-```
-Protocol:      pi_zero  (not recorded)
-               octo     (not recorded)
-```
-
-The line is never omitted, and the blank is the point: it is the case worth
-seeing, and an empty field argues for recording it better than an exception does.
-`ComparisonResult.protocol_mismatch` says whether the two sides declared the same
-thing, and both fingerprint sets are on the result.
-
-**This makes an incomparable comparison visible. It does not prevent one.**
-Whether two runs are comparable is a judgement about the experiment, and this
-package does not make it for you. The one thing it does insist on is scenario
-identity: `pair()` raises without a join key, because that is arithmetic rather
-than protocol. Without matched scenarios there is no paired comparison to
-compute.
+The groundwork is in place. `align()` builds a scenario × policy matrix for any
+number of policies, and `overlap()` already reports the structure across k:
+coverage profile, complete-case count, pairwise overlap, and which policies are
+comparable at all. A leaderboard assembled from separate papers can split into
+groups sharing no scenarios, in which case some models cannot be compared even
+indirectly, and `overlap()` says so.
 
 ---
 
-## Install
+## How to use
 
-```
-pip install robostats
-```
+Install with `pip install robostats`. Requires Python 3.10 or later; numpy and
+scipy are the only runtime dependencies.
 
-Requires Python 3.10 or later. Runtime dependencies are numpy and scipy, and
-nothing else.
-
-## Use
+### Read results you already have
 
 ```python
-from robostats import Protocol, load_jsonl, pair, compare, report
+from robostats import load_manifest, describe_preset
 
-protocol = Protocol(execution_horizon=8, reset_mode="hard", max_steps=520)
+describe_preset("robodojo")          # see exactly what the preset will do
+a = load_manifest("runs/pi_zero.json", benchmark="robodojo", protocol=protocol)
+```
 
-a = load_jsonl(
-    "runs/pi_zero.jsonl",
-    protocol=protocol,
-    policy_id_field="policy",
-    task_id_field="task",
-    success_field="success",
-    scenario_fields=("suite", "task", "init_state_id"),
-)
-b = load_jsonl("runs/octo.jsonl", protocol=protocol, ...)
+### Record results that would otherwise be lost
 
-print(report(compare(pair(a, b))))
+```python
+from robostats import EpisodeRecorder
+
+with EpisodeRecorder("runs/pi_zero.jsonl", policy_id="pi_zero",
+                     protocol=protocol) as rec:
+    for episode in eval_loop:
+        rec.record(task_id=..., scenario_id=..., success=...)
+```
+
+Each record is flushed as it is written, so a run that crashes still leaves every
+completed episode readable.
+
+### Compare
+
+```python
+from robostats import align, compare, report
+
+print(report(compare(align(a, b), mode="all")))
 ```
 
 ```
-Paired comparison: pi_zero vs octo
+Sensitivity: pi_zero vs octo
 
-Estimand:      delta = p_A - p_B, the difference in true success rate between pi_zero (A) and octo (B) on the same scenarios.
-Estimate:      delta = 0.1000  95% CI [-0.1241, 0.3264]  (tango)
-Test:          p = 0.625  (McNemar, exact)
-Pairs:         20 matched, 4 discordant
-Dropped:       0 from pi_zero, 0 from octo
-Protocol:      pi_zero  protocol 0ce610a4e6e5
-               octo     protocol 0ce610a4e6e5
+Mode      n          delta   95% CI             p
+paired    20 shared  0.1000  [-0.0772, 0.3010]  0.6250
+unpaired  25 / 23    0.0748  [-0.1996, 0.3406]  0.6005
+
+The two modes agree: neither rejects at 0.05.
 ```
-
-The protocol block is always present, one line per side, including when both
-sides declared the same thing and including when neither declared anything. A
-line that only appears when something is wrong trains readers to stop looking for
-it.
-
-### The loader guesses nothing
-
-Column names are taken literally. There is no fuzzy matching, no fallback when a
-named column is missing, and no inference of the evaluation protocol from file
-contents. A loader that decides `succ` and `is_success` both mean `success` is
-making a silent choice about your data, which is the behavior this package exists
-to surface rather than commit.
-
-### Scenario identity, not episode order
-
-Pairing joins on `scenario_id`, composed from columns you name. It never joins on
-episode index or row position. Episode indices wrap when a run requests more
-episodes than there are distinct initial states, so joining on them produces
-mismatched pairs silently, with no error and a plausible-looking result.
-
----
-
-## What it does
-
-- **Intervals**: Wilson, Clopper-Pearson, Agresti-Coull, with exact endpoints at
-  the boundaries.
-- **Paired comparison**: McNemar's test, defaulting to the exact conditional
-  binomial rather than the chi-square approximation, because discordant counts in
-  this setting are routinely small.
-- **Effect size, always**: no function returns a p-value without a point estimate
-  and an interval for it. Tango's score interval is used for the paired
-  difference.
-- **Protocol disclosure**: every comparison records the protocol fingerprints
-  each side carried and reports them per side, including blanks. Nothing about
-  the protocol blocks a comparison; scenario identity is the only requirement,
-  and it is enforced at the join.
-- **Reporting**: deterministic plain text, with p-values below 1e-4 rendered as
-  `< 0.0001` rather than as `0.0000`.
-
-## What it does not do
-
-It does not run rollouts, load policies, wrap simulators, or orchestrate
-evaluation. It reads episode records and returns statistics. Reading another
-tool's output is in scope; producing it is not.
 
 ---
 
 ## Validation
 
-Every method's coverage is measured by exact enumeration, not simulation. For
-fixed `n` and `p` the outcome space is `x = 0..n`, so coverage is a finite sum
-with no sampling error, no seed, and no confidence band around the estimate
-itself. Rerunning produces byte-identical artifacts, which means a diff in
-`results/coverage/` is always a change in the code.
+Wherever the outcome space is finite, coverage and level are measured by exact
+enumeration rather than simulation, so there is no sampling error and a diff in
+an artifact always means the code changed. Two studies cannot be enumerated and
+sample instead: parts of the partial-overlap study, and the ranking study, whose
+outcome space is too large. Both use fixed seeds and report a Monte Carlo
+standard error beside every sampled estimate.
+[`results/ranking/README.md`](results/ranking/README.md) lists which study is
+which. Curves and a hash manifest are committed under [`results/`](results/).
 
-```
-uv run python validation/coverage.py
-```
+Two things worth knowing that the studies turned up:
 
-Curves and a hash manifest are committed under `results/coverage/`. Clopper-
-Pearson is asserted to hold at or above nominal at every grid point, which is a
-theorem rather than a tolerance. Wilson and Agresti-Coull are approximate and dip
-below nominal by construction, so their curves are pinned as regressions instead.
+- The Wilson interval, the usual recommendation, delivers about 91% coverage at a
+  nominal 95% when the true success rate is near the ceiling, which is where robot
+  policies operate. Clopper-Pearson holds its guarantee for about 8% more width.
+- `statsmodels`' McNemar with the continuity correction divides by zero on a table
+  with no discordant pairs and reports `p = 0.0`: maximal significance for two
+  policies that agreed on every scenario. See
+  [`results/statsmodels-mcnemar-m0.md`](results/statsmodels-mcnemar-m0.md).
 
-This study is not decorative. It found a defect in the Tango endpoint handling at
-the parameter boundary that the unit test suite could not see.
-
-## Design principles
-
-- **Never judge whether a number is trustworthy.** Compute it, report it, stop.
-- **No silent method selection.** Nothing switches between exact and approximate
-  based on the data. The caller chooses, or gets the conservative default.
-- **Require only what changes the answer.** A field that changes the meaning of
-  the p-value or the interval is required; everything else is recorded when
-  supplied, displayed always, and never demanded. Scenario identity is required.
-  The protocol is disclosed.
-- **Test against definitions, not against other implementations.** Agreement with
-  another library only shows that two things agree. The interval endpoints are
-  checked as roots of their defining equations; the exact McNemar p-value is
-  checked in integer arithmetic.
+The coverage study also found a real defect in this package's own interval
+endpoints that the unit tests could not see, which is the argument for having it.
 
 ## Roadmap
 
-- Unpaired comparison and the paired-versus-unpaired contrast
+- Comparison across more than two policies
 - Power and minimum detectable effect
-- Adapters for common evaluation harnesses
 - A command line interface
 
 ## License
 
-Apache-2.0.
+Apache 2.0.

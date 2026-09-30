@@ -1,0 +1,10 @@
+# schema_version: 2
+# sha256 is over the full table's data lines, rounded to 12 decimals,
+#   newline separated with a trailing newline, encoded UTF-8.
+# Regenerate with: uv run python validation/partial_overlap.py
+table,rows,rows_committed,sha256
+power.csv,468,468,9f0a3cfb68a91925cdfe33654bbe4a622eb536aa3daff9b11a45eed94633a92c
+auto-level.csv,3834,369,6beba29281579f483a90a2b1221b0502fbc099e3a4d8cb99393cd214fe89afde
+mask-level.csv,162,162,45da65833e13a2eeff0e965120f8fbadb145013c87db758dc3d15d78f6ea8528
+threshold.csv,9,9,aef083aa3ce9d6c003c141769a3ec05eeb4968ebd17341f0ca69e6dcfd7c2ddb
+free-grid.csv,216,216,d4e2508db890a8735d24c6424b98b068abeae71386ae11e563d3b09a2c1b15a2

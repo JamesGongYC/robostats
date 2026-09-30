@@ -1,0 +1,6 @@
+# schema_version: 2
+# sha256 is over the full table's data lines, rounded to 12 decimals,
+#   newline separated with a trailing newline, encoded UTF-8.
+# Regenerate with: uv run python validation/cochran.py
+table,rows,rows_committed,sha256
+level.csv,1404,334,48ecb7675a123b13225708aaa0769e6f5890d4c83c0e8fc0a043b65b3bb4aef5
