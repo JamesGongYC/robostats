@@ -1,6 +1,6 @@
 [project]
 name = "robostats"
-version = "0.1.0"
+version = "0.2.0"
 description = "Statistics and uncertainty quantification for robot policy evaluation"
 readme = "README.md"
 requires-python = ">=3.11"

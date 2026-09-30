@@ -81,7 +81,7 @@ from robostats.report import report
 
 #: Package version. A test asserts this equals the version in pyproject.toml,
 #: because the two drift otherwise.
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "AUTO_MIN_SHARED",
