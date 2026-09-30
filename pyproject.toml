@@ -1,15 +1,35 @@
 [project]
 name = "robostats"
-version = "0.0.1"
+version = "0.1.0"
 description = "Statistics and uncertainty quantification for robot policy evaluation"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "scipy>=1.11"]
+requires-python = ">=3.11"
 license = "Apache-2.0"
+authors = [{ name = "James Gong", email = "jamesgongyecheng2024@gmail.com" }]
+keywords = [
+    "confidence-intervals",
+    "evaluation",
+    "mcnemar",
+    "robotics",
+    "statistics",
+    "uncertainty-quantification",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Typing :: Typed",
+]
+dependencies = ["numpy>=1.24", "scipy>=1.11"]
 
-[project.optional-dependencies]
-vla-eval = []
-lerobot = []
+[project.urls]
+Homepage = "https://github.com/jamesgyc/robostats"
+Repository = "https://github.com/jamesgyc/robostats"
+Issues = "https://github.com/jamesgyc/robostats/issues"
 
 [dependency-groups]
 dev = ["pytest>=8.0", "ruff>=0.6", "statsmodels>=0.14"]
@@ -17,6 +37,28 @@ dev = ["pytest>=8.0", "ruff>=0.6", "statsmodels>=0.14"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/robostats"]
+
+[tool.hatch.build.targets.sdist]
+# The evidence ships with the package: the committed curves, manifests and study
+# READMEs are what let a reader check the statistics without rerunning them. The
+# full-resolution output is regenerable, large, and gitignored, so it stays out.
+include = [
+    "src",
+    "tests",
+    "validation",
+    "results",
+    "docs",
+    "briefs",
+    "README.md",
+    "CHANGELOG.md",
+    "CLAUDE.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+exclude = ["results/*/full", "**/.DS_Store"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

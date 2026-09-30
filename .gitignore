@@ -14,3 +14,18 @@ __pycache__/
 # Full-resolution coverage curves: regenerate with `uv run python validation/coverage.py`.
 # The committed downsamples and manifest.csv under results/coverage/ are the checkable record.
 results/coverage/full/
+
+# Full-resolution coherence tables: regenerate with `uv run python validation/coherence.py`.
+results/coherence/full/
+
+# Full-resolution partial-overlap tables: regenerate with
+# `uv run python validation/partial_overlap.py`.
+results/partial-overlap/full/
+
+# Full-resolution combined-coverage tables: regenerate with
+# `uv run python validation/combined_coverage.py`.
+results/combined-coverage/full/
+
+# Full-resolution Cochran level table: regenerate with
+# `uv run python validation/cochran.py`.
+results/cochran/full/

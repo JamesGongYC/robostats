@@ -49,6 +49,111 @@ mapping reads back any file the recorder produces. A key that appeared only on
 some lines could not be named at all, because naming a key that is missing is an
 error.
 
+### The file states how its keys were built
+
+Each line also carries `scenario_spec`, the composition its `scenario_id` was
+built from, and `source`, the preset that produced it. Tell the recorder once:
+
+```python
+with EpisodeRecorder("runs/pi_zero.jsonl", policy_id="pi_zero",
+                     scenario_fields=("suite", "task", "init_state_id")) as recorder:
+    ...
+```
+
+and every line records it. Loading takes the file's word for it, so you do not
+have to remember or re-declare it:
+
+```python
+records = load_jsonl("runs/pi_zero.jsonl", protocol=protocol,
+                     policy_id_field="policy_id", task_id_field="task_id",
+                     success_field="success")
+
+records.scenario_spec  # ("suite", "task", "init_state_id")
+```
+
+This is worth more than a tidier report line. **Two files composed differently
+now refuse to join.** A run keyed on `{task_config}/{seed}` and a run keyed on
+the bare `seed` describe different things, and `pair()` raises
+`ScenarioSpecMismatchError` rather than matching keys that happen to look alike.
+Without the recorded composition both files read back as `("scenario_id",)`, the
+column the loader found the finished string in, and two sides that report the
+same composition can never disagree — so the check was inert on exactly the files
+this package writes.
+
+If you pass `scenario_fields` that contradict what the file states, that is an
+error naming both. The file was written by whatever built the keys; the loader
+is only reconstructing them, so where they disagree the file is right.
+
+A file whose lines disagree with *each other* is refused outright, naming both
+compositions and the line where they diverge. Keys written under two
+compositions mean two things, and choosing one of them would leave a join
+looking sound when it is not.
+
+Files written before this existed load exactly as they did: the fields are
+additive, their absence is a legitimate state, and there is no version gate and
+no warning.
+
+### Provenance repeats on every line, and that is deliberate
+
+A header would be smaller. It would also mean that a write damaged at the top of
+the file costs the provenance of every line beneath it, which is the opposite of
+what you want from a file whose whole purpose is to survive a crash. Repeated per
+line, damage costs exactly the damaged line: every other line remains a complete,
+independently readable record of what it is.
+
+A file cut off mid-write loads directly. No repair step, no flag to remember:
+
+```python
+records = load_jsonl("runs/pi_zero.jsonl", protocol=protocol, ...)
+len(records)                             # the episodes that finished
+records.provenance.interrupted_tail      # 1
+```
+
+The partial last line is discarded and **counted**, so a truncated file is
+visibly truncated rather than quietly short. It reaches the report on its own
+line:
+
+```
+Truncated:     pi_zero  1 record lost to an interrupted write
+```
+
+That is deliberately not the `Excluded:` line, which counts episodes the
+benchmark itself left out — abandoned, restarted, unstable. Those are outcomes a
+policy may have caused, and whether their absence biases the comparison is a
+question about the experiment. A truncated record is one the run finished and the
+file failed to keep. It says nothing about any policy, and reporting the two
+together would invite reading a killed process as evidence.
+
+### Why discarding that line is safe rather than a guess
+
+Two conditions have to hold together, and neither alone will discard anything:
+
+1. the file does not end in a newline, and
+2. that final line does not parse.
+
+The recorder writes the record, then the newline, then flushes. A record that
+finished is therefore always followed by its newline, so a file missing its
+trailing newline was cut off partway through writing its last record. That is a
+structural fact about how the file was produced, not an inference about what its
+contents look like.
+
+Each condition covers the other's blind spot. A broken line in a file that *does*
+end in a newline is corruption, not truncation, and raises — the writer finished
+what it was doing there. A file missing its trailing newline whose last line
+*does* parse was interrupted after the object but before the newline, so the
+record itself is complete and is kept. Damage anywhere other than the final line
+raises in every case.
+
+If you would rather have all-or-nothing, pass `strict=True` and the interrupted
+file raises as any other unreadable one would:
+
+```python
+records = load_jsonl("runs/pi_zero.jsonl", protocol=protocol, strict=True, ...)
+```
+
+Everything before the interrupted line is intact either way, and loads with its
+provenance complete.
+
 The protocol is written into the file for a human reading it, and is **not** read
 back: `load_jsonl` takes it as an argument, because this package never infers a
 protocol from a file's contents.
@@ -130,15 +235,24 @@ file you own and RoboTwin needs no patch:
 from robostats import EpisodeRecorder, Protocol
 from robostats.adapters.robotwin import record_trial_end
 
+TASK_CONFIG = "demo_clean"
+
 recorder = EpisodeRecorder(
     "runs/pi_zero_demo_clean.jsonl",
     policy_id="pi_zero",
     protocol=Protocol(execution_horizon=8, reset_mode="hard"),
+    preset="robotwin",
+    scenario_prefix=(TASK_CONFIG,),
 )
 
 def handle_trial_end(payload):
-    record_trial_end(recorder, payload, task_config="demo_clean")
+    record_trial_end(recorder, payload, task_config=TASK_CONFIG)
 ```
+
+`preset="robotwin"` and `scenario_prefix` tell the recorder what to stamp on
+every line: the composition `{task_config}/{seed}` and the source `robotwin@1`.
+Bind the configuration to a name, as above, so the value the recorder records and
+the value the handler composes with cannot drift apart.
 
 `task_config` is pinned by you rather than read from the payload, because the
 payload does not carry it: it is a directory name. `record_trial_end` composes
@@ -179,7 +293,8 @@ scope:
 # at the top of the eval script
 from robostats import EpisodeRecorder, Protocol
 recorder = EpisodeRecorder("runs/pi_zero_libero.jsonl", policy_id="pi_zero",
-                           protocol=Protocol(execution_horizon=8))
+                           protocol=Protocol(execution_horizon=8),
+                           scenario_fields=("task_suite_name", "task_id", "init_state_id"))
 
 # inside the loop, where num_success += dones[k] already happens
 recorder.record(task_id=task_id, scenario_id=f"{task_suite_name}/{task_id}/{init_state_id}",
