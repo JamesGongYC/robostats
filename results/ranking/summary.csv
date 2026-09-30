@@ -1,0 +1,23 @@
+# schema_version: 2
+quantity,value
+configurations,360
+replicates_per_configuration,2000
+seed,20260924
+nominal,0.95
+configurations_below_nominal,1
+configurations_below_nominal_beyond_two_se,0
+worst_coverage,0.948
+worst_coverage_standard_error,0.004964675216
+replicates_refused,0
+replicates_with_empty_set,0
+rank_configurations,144
+rank_simulations_per_configuration,2000
+rank_pairwise_joint_below_nominal,0
+rank_pairwise_joint_below_nominal_beyond_two_se,0
+rank_pairwise_lowest_joint,0.997
+rank_composition_violations,0
+rank_bootstrap_bootstrap_replicates,2000
+rank_bootstrap_marginal_below_nominal,16
+rank_bootstrap_marginal_below_nominal_beyond_two_se,13
+rank_bootstrap_lowest_marginal,0.856
+rank_refused,0

@@ -1,0 +1,8 @@
+# schema_version: 2
+# sha256 is over the full table's data lines, rounded to 12 decimals,
+#   newline separated with a trailing newline, encoded UTF-8.
+# Regenerate with: uv run python validation/ranking.py
+table,rows,rows_committed,sha256
+coverage.csv,360,360,615da44b0aaa1b0a01e0f241b6f6ddd07e8db608ea1d1199ed8d0daaa18a65c8
+rank-coverage.csv,144,144,aaff5e66824b15128068bd1b0de8a6e24f25e42ae707fa247e6164c3e1537157
+detectable-difference.csv,8,8,3006be15ed3144826283441c9e8920cbf108c6fcb063b60fd906b97f7c1c3915
