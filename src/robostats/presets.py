@@ -152,6 +152,36 @@ class Preset:
             f"all; there is no fallback to generic loading."
         )
 
+    @property
+    def stamp(self) -> str:
+        """This preset as one string, ``name@version``, for writing into a file."""
+        return f"{self.name}@{self.version}"
+
+    def scenario_spec_for(self, prefix: Sequence[str]) -> tuple[str, ...] | None:
+        """The recorded composition for keys this preset composes behind ``prefix``.
+
+        Literal components are quoted, exactly as
+        :class:`~robostats.records.RecordSet`'s ``scenario_spec`` renders them
+        everywhere else, so a literal stays distinguishable from a field name
+        after a round trip through a file.
+
+        Parameters
+        ----------
+        prefix : Sequence[str]
+            Values for the literal components, in the order of
+            ``scenario_prefix_names``.
+
+        Returns
+        -------
+        tuple of str, or None
+            The composition, or ``None`` if this preset composes nothing.
+        """
+        self._check_prefix(prefix)
+        fields = tuple(self.arguments.get("scenario_fields", ()))
+        if not fields:
+            return None
+        return tuple(repr(value) for value in prefix) + fields
+
     def compose_scenario_id(self, prefix: Sequence[str], values: Mapping[str, Any]) -> str:
         """Compose a ``scenario_id`` the way this preset declares.
 

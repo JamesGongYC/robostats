@@ -1056,3 +1056,154 @@ def test_the_same_configuration_on_both_sides_joins_normally(tmp_path: Path) -> 
     assert matched.n_pairs == 3
     assert matched.scenario_spec_a == ("'demo_clean'", "task", "seed")
     assert matched.scenario_spec_b == matched.scenario_spec_a
+
+
+# --------------------------------------------------------------------------------------
+# Provenance a file states about itself
+# --------------------------------------------------------------------------------------
+
+STATED_ROWS = [
+    {
+        "policy_id": "pi_zero",
+        "task_id": "block_hammer_beat",
+        "success": True,
+        "scenario_id": "demo_clean/17",
+        "scenario_spec": ["'demo_clean'", "seed"],
+        "source": "robotwin@1",
+    },
+    {
+        "policy_id": "pi_zero",
+        "task_id": "block_hammer_beat",
+        "success": False,
+        "scenario_id": "demo_clean/18",
+        "scenario_spec": ["'demo_clean'", "seed"],
+        "source": "robotwin@1",
+    },
+]
+
+STATED_MAPPING = {
+    "policy_id_field": "policy_id",
+    "task_id_field": "task_id",
+    "success_field": "success",
+}
+
+
+def test_a_file_that_states_its_composition_is_believed(tmp_path: Path) -> None:
+    # The file was written by whatever built the keys; the loader reading the
+    # finished string is only reconstructing them.
+    loaded = load_jsonl(
+        write_jsonl(tmp_path / "a.jsonl", STATED_ROWS), protocol=PROTOCOL, **STATED_MAPPING
+    )
+    assert loaded.scenario_spec == ("'demo_clean'", "seed")
+    assert [record.scenario_id for record in loaded] == ["demo_clean/17", "demo_clean/18"]
+    assert loaded.provenance is not None
+    assert (loaded.provenance.preset, loaded.provenance.preset_version) == ("robotwin", "1")
+
+
+def test_naming_the_key_column_is_not_a_conflict(tmp_path: Path) -> None:
+    # scenario_fields=("scenario_id",) is how a caller says "read the composed
+    # key verbatim", which is exactly what the recorded composition describes.
+    loaded = load_jsonl(
+        write_jsonl(tmp_path / "a.jsonl", STATED_ROWS),
+        protocol=PROTOCOL,
+        scenario_fields=("scenario_id",),
+        **STATED_MAPPING,
+    )
+    assert loaded.scenario_spec == ("'demo_clean'", "seed")
+
+
+def test_scenario_fields_that_contradict_the_file_raise(tmp_path: Path) -> None:
+    rows = [{**row, "seed": 17 + index} for index, row in enumerate(STATED_ROWS)]
+    with pytest.raises(LoadError) as caught:
+        load_jsonl(
+            write_jsonl(tmp_path / "a.jsonl", rows),
+            protocol=PROTOCOL,
+            scenario_fields=("seed",),
+            **STATED_MAPPING,
+        )
+    message = str(caught.value)
+    assert "'demo_clean' / seed" in message
+    assert "('seed',)" in message
+    assert "drop scenario_fields" in message
+
+
+def test_lines_that_disagree_about_the_composition_are_refused(tmp_path: Path) -> None:
+    # A file written under two compositions holds keys that mean two things.
+    rows = [
+        STATED_ROWS[0],
+        STATED_ROWS[1],
+        {**STATED_ROWS[1], "scenario_spec": ["'demo_randomized'", "seed"]},
+    ]
+    with pytest.raises(LoadError) as caught:
+        load_jsonl(write_jsonl(tmp_path / "a.jsonl", rows), protocol=PROTOCOL, **STATED_MAPPING)
+    message = str(caught.value)
+    assert "line 3" in message
+    assert "line 1" in message
+    assert "'demo_randomized' / seed" in message
+    assert "'demo_clean' / seed" in message
+
+
+def test_a_line_that_states_nothing_among_lines_that_do_is_refused(tmp_path: Path) -> None:
+    rows = [
+        STATED_ROWS[0],
+        {key: value for key, value in STATED_ROWS[1].items() if key not in {"scenario_spec", "source"}},
+    ]
+    with pytest.raises(LoadError, match="none recorded"):
+        load_jsonl(write_jsonl(tmp_path / "a.jsonl", rows), protocol=PROTOCOL, **STATED_MAPPING)
+
+
+def test_a_file_stating_a_source_but_no_composition(tmp_path: Path) -> None:
+    rows = [{**row, "scenario_spec": None} for row in STATED_ROWS]
+    loaded = load_jsonl(
+        write_jsonl(tmp_path / "a.jsonl", rows),
+        protocol=PROTOCOL,
+        scenario_fields=("scenario_id",),
+        **STATED_MAPPING,
+    )
+    assert loaded.scenario_spec == ("scenario_id",)
+    assert loaded.provenance is not None and loaded.provenance.preset == "robotwin"
+
+
+def test_a_file_from_before_this_existed_loads_unchanged(tmp_path: Path) -> None:
+    # Written in the old shape here rather than by stripping fields from new
+    # output, so the test would still catch a change that made the old shape
+    # unreadable.
+    old_shape = [
+        {
+            "policy_id": "pi_zero",
+            "task_id": "block_hammer_beat",
+            "success": True,
+            "scenario_id": "demo_clean/17",
+            "episode_idx": None,
+            "seed": 17,
+            "success_detail": None,
+            "run_id": "r1",
+            "schema_version": 2,
+        },
+        {
+            "policy_id": "pi_zero",
+            "task_id": "block_hammer_beat",
+            "success": False,
+            "scenario_id": "demo_clean/18",
+            "episode_idx": None,
+            "seed": 18,
+            "success_detail": 0.4,
+            "run_id": "r1",
+            "schema_version": 2,
+        },
+    ]
+    loaded = load_jsonl(
+        write_jsonl(tmp_path / "old.jsonl", old_shape),
+        protocol=PROTOCOL,
+        scenario_fields=("scenario_id",),
+        seed_field="seed",
+        run_id_field="run_id",
+        success_detail_field="success_detail",
+        **STATED_MAPPING,
+    )
+    assert len(loaded) == 2
+    # No version gate and no warning: the composition is derived from what the
+    # caller named, and nothing produced the file as far as the loader knows.
+    assert loaded.scenario_spec == ("scenario_id",)
+    assert loaded.provenance is None
+    assert loaded.records[1].success_detail == 0.4

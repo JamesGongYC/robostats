@@ -9,10 +9,15 @@ from pathlib import Path
 import pytest
 
 from robostats.adapters.robotwin import record_trial_end
-from robostats.errors import LoadError, PresetMismatchError, SchemaError
+from robostats.errors import (
+    LoadError,
+    PresetMismatchError,
+    ScenarioSpecMismatchError,
+    SchemaError,
+)
 from robostats.io import load_jsonl
 from robostats.recording import EpisodeRecorder
-from robostats.records import SCHEMA_VERSION, EpisodeRecord, Protocol
+from robostats.records import SCHEMA_VERSION, EpisodeRecord, Protocol, pair
 
 PROTOCOL = Protocol(execution_horizon=8, reset_mode="hard", max_steps=520)
 
@@ -87,7 +92,7 @@ def test_every_schema_field_is_written_even_when_unset(tmp_path: Path) -> None:
     with EpisodeRecorder(path, policy_id="pi_zero") as recorder:
         recorder.record(task_id="t", scenario_id="s", success=True)
     row = json.loads(path.read_text().splitlines()[0])
-    assert set(row) == {
+    schema_fields = {
         "schema_version",
         "policy_id",
         "task_id",
@@ -98,6 +103,9 @@ def test_every_schema_field_is_written_even_when_unset(tmp_path: Path) -> None:
         "success_detail",
         "run_id",
     }
+    # The provenance keys sit alongside the schema fields; they do not replace
+    # any of them, and every schema field is still written unconditionally.
+    assert set(row) == schema_fields | {"scenario_spec", "source"}
     assert row["seed"] is None
 
 
@@ -338,3 +346,276 @@ def test_recording_imports_no_harness() -> None:
             if module not in allowed and module not in sys.stdlib_module_names
         }
         assert external == set(), name
+
+
+# --------------------------------------------------------------------------------------
+# The gap this provenance closes
+# --------------------------------------------------------------------------------------
+
+READ_RECORDED = {
+    "policy_id_field": "policy_id",
+    "task_id_field": "task_id",
+    "success_field": "success",
+}
+
+
+def recorded_run(path: Path, policy: str, task_config: str, seeds: tuple[int, ...]) -> Path:
+    """A RoboTwin run recorded under one configuration."""
+    with EpisodeRecorder(
+        path, policy_id=policy, preset="robotwin", scenario_prefix=(task_config,)
+    ) as recorder:
+        for seed in seeds:
+            record_trial_end(
+                recorder, {"task_name": "block_hammer_beat", "seed": seed, "success": True},
+                task_config=task_config,
+            )
+    return path
+
+
+def test_two_files_composed_differently_refuse_to_join(tmp_path: Path) -> None:
+    """Two runs this package recorded, and a join that used to succeed silently.
+
+    Both runs used seeds 17, 18 and 19. One ran under ``demo_clean`` and the
+    other under ``demo_randomized``, which are different scene distributions, so
+    an episode from one has nothing to do with the episode from the other that
+    happens to share a seed.
+
+    The keys themselves do differ, because the recorder composes the
+    configuration into them. What used to be lost was *why*: read back, both
+    files reported their composition as ``("scenario_id",)``, because that is the
+    column the loader read the finished string out of. Two sides reporting the
+    same composition can never disagree, so brief 06's check was inert on exactly
+    the files this package writes, and a caller who had composed the keys without
+    the configuration would have been joined without complaint.
+
+    Now each line states how its key was built, so the two sides disagree and say
+    so.
+    """
+    seeds = (17, 18, 19)
+    clean = load_jsonl(
+        recorded_run(tmp_path / "clean.jsonl", "pi_zero", "demo_clean", seeds),
+        protocol=PROTOCOL,
+        **READ_RECORDED,
+    )
+    randomized = load_jsonl(
+        recorded_run(tmp_path / "random.jsonl", "octo", "demo_randomized", seeds),
+        protocol=PROTOCOL,
+        **READ_RECORDED,
+    )
+
+    # What each side says about itself, exactly.
+    assert clean.scenario_spec == ("'demo_clean'", "seed")
+    assert randomized.scenario_spec == ("'demo_randomized'", "seed")
+
+    with pytest.raises(ScenarioSpecMismatchError) as caught:
+        pair(clean, randomized)
+    message = str(caught.value)
+    assert "'demo_clean'" in message
+    assert "'demo_randomized'" in message
+
+
+def test_two_files_composed_the_same_way_join(tmp_path: Path) -> None:
+    seeds = (17, 18, 19)
+    a = load_jsonl(
+        recorded_run(tmp_path / "a.jsonl", "pi_zero", "demo_clean", seeds),
+        protocol=PROTOCOL,
+        **READ_RECORDED,
+    )
+    b = load_jsonl(
+        recorded_run(tmp_path / "b.jsonl", "octo", "demo_clean", seeds),
+        protocol=PROTOCOL,
+        **READ_RECORDED,
+    )
+    matched = pair(a, b)
+    assert matched.n_pairs == 3
+    assert matched.scenario_spec_a == matched.scenario_spec_b == ("'demo_clean'", "seed")
+
+
+# --------------------------------------------------------------------------------------
+# Round trip of the provenance itself
+# --------------------------------------------------------------------------------------
+
+
+def test_the_composition_and_source_survive_the_round_trip(tmp_path: Path) -> None:
+    path = recorded_run(tmp_path / "run.jsonl", "pi_zero", "demo_clean", (17,))
+    loaded = load_jsonl(path, protocol=PROTOCOL, **READ_RECORDED)
+    # Exact: a spec is a tuple of strings and a stamp is a string.
+    assert loaded.scenario_spec == ("'demo_clean'", "seed")
+    assert loaded.provenance is not None
+    assert loaded.provenance.preset == "robotwin"
+    assert loaded.provenance.preset_version == "1"
+    assert loaded.records[0].scenario_id == "demo_clean/17"
+
+
+def test_recording_without_a_preset_records_no_source(tmp_path: Path) -> None:
+    path = tmp_path / "run.jsonl"
+    with EpisodeRecorder(
+        path, policy_id="pi_zero", scenario_fields=("suite", "init_state_id")
+    ) as recorder:
+        recorder.record(task_id="t", scenario_id="libero_object/17", success=True)
+    row = json.loads(path.read_text().splitlines()[0])
+    assert row["source"] is None
+    assert row["scenario_spec"] == ["suite", "init_state_id"]
+
+    loaded = load_jsonl(path, protocol=PROTOCOL, **READ_RECORDED)
+    assert loaded.scenario_spec == ("suite", "init_state_id")
+    assert loaded.provenance is None
+
+
+def test_recording_without_a_composition_records_no_spec(tmp_path: Path) -> None:
+    path = tmp_path / "run.jsonl"
+    with EpisodeRecorder(path, policy_id="pi_zero") as recorder:
+        recorder.record(task_id="t", scenario_id="whatever", success=True)
+    row = json.loads(path.read_text().splitlines()[0])
+    assert row["scenario_spec"] is None
+    assert row["source"] is None
+    loaded = load_jsonl(
+        path, protocol=PROTOCOL, scenario_fields=("scenario_id",), **READ_RECORDED
+    )
+    assert loaded.scenario_spec == ("scenario_id",)
+
+
+# --------------------------------------------------------------------------------------
+# Crash resilience, which is why the provenance repeats per line
+# --------------------------------------------------------------------------------------
+
+
+def truncate_mid_line(path: Path) -> int:
+    """Cut ``path`` partway through its last line, as a killed process would.
+
+    Returns the number of complete lines left behind.
+    """
+    lines = path.read_bytes().splitlines(keepends=True)
+    truncated = b"".join(lines[:-1]) + lines[-1][:60]
+    assert not truncated.endswith(b"\n"), "the cut must land inside the last line"
+    path.write_bytes(truncated)
+    return len(lines) - 1
+
+
+def test_a_file_cut_off_mid_write_loads_the_records_it_did_finish(tmp_path: Path) -> None:
+    # An eval process killed mid-write leaves a partial last line. Every line
+    # before it was written whole and flushed, and each carries its own
+    # provenance, so the run's completed episodes load directly.
+    path = recorded_run(tmp_path / "run.jsonl", "pi_zero", "demo_clean", (17, 18, 19, 20, 21))
+    complete = truncate_mid_line(path)
+
+    loaded = load_jsonl(path, protocol=PROTOCOL, **READ_RECORDED)
+    assert len(loaded) == complete == 4
+    assert [record.scenario_id for record in loaded] == [
+        "demo_clean/17",
+        "demo_clean/18",
+        "demo_clean/19",
+        "demo_clean/20",
+    ]
+    assert loaded.scenario_spec == ("'demo_clean'", "seed")
+    assert loaded.provenance is not None
+    assert loaded.provenance.preset == "robotwin"
+
+
+def test_a_discarded_partial_line_is_counted_not_swallowed(tmp_path: Path) -> None:
+    # A truncated file should be visibly truncated. A caller comparing the
+    # record count against the episodes they expected can see one is missing.
+    path = recorded_run(tmp_path / "run.jsonl", "pi_zero", "demo_clean", (17, 18, 19))
+    truncate_mid_line(path)
+
+    loaded = load_jsonl(path, protocol=PROTOCOL, **READ_RECORDED)
+    assert loaded.provenance is not None
+    assert loaded.provenance.interrupted_tail == 1
+    # Counted apart from the episodes a benchmark itself excluded: those are
+    # evidence about the run, this is evidence about the file.
+    assert loaded.provenance.excluded == {}
+
+
+def test_the_discard_reaches_the_report(tmp_path: Path) -> None:
+    from robostats.compare import compare
+    from robostats.report import report
+
+    seeds = (17, 18, 19, 20)
+    whole = load_jsonl(
+        recorded_run(tmp_path / "whole.jsonl", "pi_zero", "demo_clean", seeds),
+        protocol=PROTOCOL,
+        **READ_RECORDED,
+    )
+    cut_path = recorded_run(tmp_path / "cut.jsonl", "octo", "demo_clean", seeds)
+    truncate_mid_line(cut_path)
+    cut = load_jsonl(cut_path, protocol=PROTOCOL, **READ_RECORDED)
+
+    rendered = report(compare(pair(whole, cut)))
+    truncated = [line for line in rendered.splitlines() if line.startswith("Truncated:")]
+    assert len(truncated) == 1
+    assert "octo" in truncated[0]
+    assert "1 record lost to an interrupted write" in truncated[0]
+    assert "Excluded:" not in rendered
+
+
+def test_strict_refuses_the_truncated_file(tmp_path: Path) -> None:
+    # All or nothing, for a caller who would rather repair the file than load a
+    # run that is quietly one episode short.
+    path = recorded_run(tmp_path / "run.jsonl", "pi_zero", "demo_clean", (17, 18, 19))
+    truncate_mid_line(path)
+    with pytest.raises(LoadError, match="not valid JSON"):
+        load_jsonl(path, protocol=PROTOCOL, strict=True, **READ_RECORDED)
+
+
+def test_an_unparseable_line_in_the_middle_still_raises(tmp_path: Path) -> None:
+    # Only the final line of a file with no trailing newline is a signature of an
+    # interrupted write. Damage anywhere else is damage.
+    path = recorded_run(tmp_path / "run.jsonl", "pi_zero", "demo_clean", (17, 18, 19))
+    lines = path.read_text().splitlines()
+    lines[1] = lines[1][:60]
+    path.write_text("\n".join(lines) + "\n")
+    with pytest.raises(LoadError, match="line 2: not valid JSON"):
+        load_jsonl(path, protocol=PROTOCOL, **READ_RECORDED)
+
+
+def test_an_unparseable_last_line_that_ends_in_a_newline_still_raises(tmp_path: Path) -> None:
+    # Both conditions, never either alone. A newline means the writer finished
+    # what it was doing, so a broken line there is corruption, not truncation.
+    path = recorded_run(tmp_path / "run.jsonl", "pi_zero", "demo_clean", (17, 18, 19))
+    lines = path.read_text().splitlines()
+    lines[-1] = lines[-1][:60]
+    path.write_text("\n".join(lines) + "\n")
+    with pytest.raises(LoadError, match="line 3: not valid JSON"):
+        load_jsonl(path, protocol=PROTOCOL, **READ_RECORDED)
+
+
+def test_a_missing_newline_alone_discards_nothing(tmp_path: Path) -> None:
+    # The other half of "never either alone". If the write was interrupted after
+    # the object but before the newline, the record itself is complete, parses,
+    # and is kept.
+    path = recorded_run(tmp_path / "run.jsonl", "pi_zero", "demo_clean", (17, 18, 19))
+    path.write_bytes(path.read_bytes().rstrip(b"\n"))
+
+    loaded = load_jsonl(path, protocol=PROTOCOL, **READ_RECORDED)
+    assert len(loaded) == 3
+    assert loaded.provenance is not None
+    assert loaded.provenance.interrupted_tail == 0
+
+
+def test_damage_to_the_first_line_does_not_cost_the_provenance_of_the_rest(
+    tmp_path: Path,
+) -> None:
+    # The header counterfactual, made concrete. Had the composition been written
+    # once at the top of the file, this damage would have taken the provenance of
+    # every line with it. Repeated per line, it costs exactly one line.
+    path = recorded_run(tmp_path / "run.jsonl", "pi_zero", "demo_clean", (17, 18, 19))
+    lines = path.read_bytes().splitlines(keepends=True)
+    surviving = tmp_path / "surviving.jsonl"
+    surviving.write_bytes(b"".join(lines[1:]))
+
+    loaded = load_jsonl(surviving, protocol=PROTOCOL, **READ_RECORDED)
+    assert len(loaded) == 2
+    assert loaded.scenario_spec == ("'demo_clean'", "seed")
+    assert loaded.provenance is not None and loaded.provenance.preset == "robotwin"
+
+
+def test_every_line_carries_the_provenance_independently(tmp_path: Path) -> None:
+    # The property the repetition buys: any single line, alone, is a complete
+    # record of what it is.
+    path = recorded_run(tmp_path / "run.jsonl", "pi_zero", "demo_clean", (17, 18, 19))
+    for index, line in enumerate(path.read_text().splitlines()):
+        alone = tmp_path / f"line_{index}.jsonl"
+        alone.write_text(line + "\n")
+        loaded = load_jsonl(alone, protocol=PROTOCOL, **READ_RECORDED)
+        assert loaded.scenario_spec == ("'demo_clean'", "seed")
+        assert loaded.provenance is not None and loaded.provenance.preset == "robotwin"

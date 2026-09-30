@@ -56,6 +56,16 @@ class ProtocolMismatchError(RobostatsError):
     """
 
 
+class NotComparableError(RobostatsError):
+    """Raised when no statistic can span the policies given.
+
+    A comparison needs scenarios the policies share. Where the graph of pairwise
+    overlap is disconnected, no set of scenarios is common to all of them, and no
+    amount of data inside each group repairs that. The message names the groups,
+    because a comparison within each one separately is still available and is
+    usually what the caller wants next.
+    """
+
 class LoadError(RobostatsError):
     """A file could not be read into records under the mapping the caller gave.
 

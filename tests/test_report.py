@@ -199,8 +199,10 @@ def test_a_small_p_value_is_not_rounded_to_zero() -> None:
 @pytest.mark.parametrize(
     ("p_value", "expected"),
     [
-        (0.625, "0.625"),
-        (0.05, "0.05"),
+        (1.0, "1.0000"),
+        (0.625, "0.6250"),
+        (0.5, "0.5000"),
+        (0.05, "0.0500"),
         (0.0001234, "0.0001234"),
         (1e-4, "0.0001"),
         (9.99e-5, "< 0.0001"),
@@ -215,6 +217,22 @@ def test_p_value_formatting(p_value: float, expected: str) -> None:
 def test_p_value_uses_four_significant_figures() -> None:
     assert format_p_value(0.123456789) == "0.1235"
     assert format_p_value(0.6170750774519739) == "0.6171"
+
+
+def test_a_p_value_is_never_shown_to_fewer_than_four_decimals() -> None:
+    # Four significant figures is a ceiling on precision, not a licence to show
+    # less. A bare "1" reads as a placeholder rather than a result, and a value
+    # shown to fewer digits than its neighbours reads as a different kind of
+    # quantity.
+    for p_value in (1.0, 0.5, 0.25, 0.125, 0.0625):
+        rendered = format_p_value(p_value)
+        assert len(rendered.partition(".")[2]) >= 4, rendered
+
+
+def test_an_exact_one_renders_as_one_in_a_report() -> None:
+    # m = 0: the two policies agreed on every scenario, so p is exactly 1.
+    rendered = report(compare(table(10, 0, 0, 5)))
+    assert "p = 1.0000" in rendered
 
 
 def test_proportions_use_four_decimals() -> None:
@@ -412,5 +430,84 @@ def test_excluded_counts_are_stated_per_side_when_present() -> None:
     assert compare(paired).n_pairs == 20
 
 
+def test_a_lost_record_reads_differently_from_an_excluded_episode() -> None:
+    # An excluded episode is one the run left out, which a policy may have
+    # caused. A truncated record is one the run finished and the file lost,
+    # which says nothing about any policy. One line each, so a disk failure is
+    # never read as evidence.
+    paired = dataclasses.replace(
+        table(10, 3, 1, 6),
+        provenance_a=LoadProvenance(excluded={"abandoned": 8}),
+        provenance_b=LoadProvenance(interrupted_tail=1),
+    )
+    rendered = report(compare(paired))
+    excluded = next(line for line in rendered.splitlines() if line.startswith("Excluded:"))
+    truncated = next(line for line in rendered.splitlines() if line.startswith("Truncated:"))
+    assert "pi_zero" in excluded and "abandoned=8" in excluded
+    assert "octo" in truncated and "1 record lost to an interrupted write" in truncated
+
+
+def test_several_lost_records_read_as_plural() -> None:
+    paired = dataclasses.replace(
+        table(10, 3, 1, 6), provenance_a=LoadProvenance(interrupted_tail=3)
+    )
+    line = next(
+        line for line in report(compare(paired)).splitlines() if line.startswith("Truncated:")
+    )
+    assert "3 records lost" in line
+
+
+def test_no_truncated_line_when_nothing_was_lost() -> None:
+    assert "Truncated:" not in report(compare(table(10, 3, 1, 6)))
+
+
 def test_no_excluded_line_when_nothing_was_excluded() -> None:
     assert "Excluded:" not in report(compare(table(10, 3, 1, 6)))
+
+
+# --------------------------------------------------------------------------------------
+# Coherence between the interval and the p-value
+# --------------------------------------------------------------------------------------
+
+
+def test_the_note_fires_when_the_two_lines_disagree() -> None:
+    # Five discordant pairs, all favouring a. The exact conditional test gives
+    # p = 0.0625 and does not reject at 0.05; the asymptotic interval excludes
+    # zero. A reader taking one line and not the other gets opposite answers,
+    # so the report says so instead of leaving them to notice.
+    result = compare(table(0, 5, 0, 5))
+    assert result.is_coherent is False
+
+    rendered = report(result)
+    note = next(line for line in rendered.splitlines() if line.startswith("Note:"))
+    assert "the interval excludes 0" in note
+    assert "p = 0.0625" in note
+    assert "does not reject at 0.05" in note
+    assert "The exact test is conservative; the interval is asymptotic." in rendered
+    # Neither number is suppressed or adjusted.
+    assert "p = 0.0625" in rendered
+    assert "[0.0837, 0.7634]" in rendered
+
+
+def test_no_note_when_the_two_lines_agree() -> None:
+    result = compare(table(10, 3, 1, 6))
+    assert result.is_coherent is True
+    assert "Note:" not in report(result)
+
+
+def test_no_note_when_both_reject() -> None:
+    # Agreement in the other direction: the interval excludes zero and the test
+    # rejects, so there is nothing to say.
+    result = compare(table(0, 25, 0, 25))
+    assert result.p_value < 0.05
+    assert not (result.interval.lower <= 0.0 <= result.interval.upper)
+    assert result.is_coherent is True
+    assert "Note:" not in report(result)
+
+
+def test_coherence_is_judged_at_the_level_asked_for() -> None:
+    # The same table, read at two levels: the disagreement at 95% is not a
+    # disagreement at 90%, because the interval and the threshold both move.
+    paired = table(0, 5, 0, 5)
+    assert compare(paired, confidence=0.95).is_coherent is False
+    assert compare(paired, confidence=0.90).is_coherent is True

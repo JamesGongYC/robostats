@@ -27,7 +27,10 @@ silently produces mismatched pairs.
 They record how they composed it. The returned :class:`RecordSet` carries
 ``scenario_spec``, the ordered field names that went into ``scenario_id``, so
 that :func:`~robostats.records.pair` can refuse to join two sides whose keys were
-built from different fields. The package cannot know which fields *should* have
+built from different fields. A file written by
+:class:`~robostats.recording.EpisodeRecorder` states its own composition on every
+line, and that statement wins: the recorder knew how the key was built, while a
+loader reading the finished string is only reconstructing it. The package cannot know which fields *should* have
 been included; recording which ones were is what makes the difference visible.
 
 They apply a preset only when asked. ``benchmark="robotwin"`` is the caller
@@ -46,8 +49,8 @@ from __future__ import annotations
 
 import csv
 import json
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -189,6 +192,7 @@ def load_jsonl(
     run_id: str | None = None,
     run_id_field: str | None = None,
     success_detail_field: str | None = None,
+    strict: bool = False,
 ) -> RecordSet:
     """Load records from a JSON Lines file, one record object per line.
 
@@ -238,11 +242,20 @@ def load_jsonl(
     success_detail_field : str or None
         Key holding a raw partial or continuous score, recorded as
         ``success_detail``. It is never thresholded into ``success``.
+    strict : bool, default False
+        Refuse a file whose final line was interrupted mid-write. By default
+        such a line is discarded and counted, because a writer appending records
+        writes the object, then the newline, then flushes: a file that does not
+        end in a newline was cut off before its last record was complete. Both
+        conditions are required, so a completed record can never be dropped, and
+        an unparseable line anywhere else in the file still raises either way.
 
     Returns
     -------
     RecordSet
-        The records, in file order, carrying ``scenario_spec``.
+        The records, in file order, carrying ``scenario_spec``. A discarded
+        final line is counted in ``provenance.interrupted_tail``, so a truncated
+        file is visibly truncated rather than quietly short.
 
     Raises
     ------
@@ -278,26 +291,54 @@ def load_jsonl(
     mapping = _FieldMap(**arguments)
     mapping.validate(location.path)
 
-    records: list[EpisodeRecord] = []
-    for line_number, line in _read_lines(location):
+    document = _read_text(location)
+    lines = document.splitlines()
+    # A writer appending records writes the object, then the newline, then
+    # flushes. A file that does not end in a newline was therefore cut off
+    # partway through its last record, which is a structural fact about the
+    # file rather than a guess about its contents.
+    interrupted_tail = bool(lines) and not document.endswith(("\n", "\r"))
+
+    rows: list[tuple[int, dict[str, Any]]] = []
+    recorded = _Recorded()
+    discarded = 0
+    for line_number, line in enumerate(lines, start=1):
         text = line.strip()
         if not text:
             continue
-        row = _parse_json_object(text, location.at(line_number))
-        if not records:
+        last = line_number == len(lines)
+        try:
+            row = _parse_json_object(text, location.at(line_number))
+        except LoadError:
+            # Only here, and only both conditions together: a completed record
+            # is always followed by its newline, so this can never drop one.
+            if strict or not (last and interrupted_tail):
+                raise
+            discarded += 1
+            continue
+        if not rows:
             _check_preset_shape(benchmark, list(row), location.path)
-        records.append(
-            _build_record(
-                row,
-                location=location.at(line_number),
-                protocol=protocol,
-                mapping=mapping,
-                readers=_JSON_READERS,
-            )
-        )
-    if not records:
+        recorded = _read_recorded(row, line_number, recorded, location.path)
+        rows.append((line_number, row))
+    if not rows:
         raise LoadError(f"{location.path}: holds no records; expected one JSON object per line")
-    return RecordSet(records, scenario_spec=mapping.scenario_spec, provenance=provenance)
+
+    mapping, scenario_spec = _reconcile_spec(recorded, mapping, location.path)
+    records = [
+        _build_record(
+            row,
+            location=location.at(line_number),
+            protocol=protocol,
+            mapping=mapping,
+            readers=_JSON_READERS,
+        )
+        for line_number, row in rows
+    ]
+    return RecordSet(
+        records,
+        scenario_spec=scenario_spec,
+        provenance=_merge_provenance(provenance, recorded, discarded),
+    )
 
 
 def load_csv(
@@ -575,6 +616,117 @@ class _Readers:
     number: Any
 
 
+#: Keys an EpisodeRecorder writes alongside the record's own fields.
+RECORDED_SPEC_KEY = "scenario_spec"
+RECORDED_SOURCE_KEY = "source"
+
+#: The column a recorder writes its already-composed key into. Naming it as the
+#: whole composition is how a caller reads that key back verbatim, so it is the
+#: one field list that does not conflict with a recorded composition.
+RECORDED_KEY_FIELD = "scenario_id"
+
+
+@dataclass(frozen=True, slots=True)
+class _Recorded:
+    """Provenance a file states about itself, gathered while reading it."""
+
+    spec: tuple[str, ...] | None = None
+    source: str | None = None
+    line: int | None = None
+    present: bool = False
+
+
+def _read_recorded(row: Mapping[str, Any], line: int, seen: _Recorded, path: Path) -> _Recorded:
+    """Fold one row's stated provenance into what the file has said so far.
+
+    Raises
+    ------
+    LoadError
+        If this row disagrees with an earlier one. A file whose lines were
+        written under two compositions holds keys that mean two things, and
+        picking the first, the last or the majority would leave the join looking
+        sound. It is refused instead.
+    """
+    if RECORDED_SPEC_KEY not in row and RECORDED_SOURCE_KEY not in row:
+        current = _Recorded()
+    else:
+        raw = row.get(RECORDED_SPEC_KEY)
+        current = _Recorded(
+            spec=None if raw is None else tuple(str(value) for value in raw),
+            source=row.get(RECORDED_SOURCE_KEY),
+            line=line,
+            present=True,
+        )
+    if not seen.present:
+        return current if current.present else seen
+    if current.present and current.spec == seen.spec:
+        return seen
+    raise LoadError(
+        f"{path}: line {line} states a different scenario_id composition from line "
+        f"{seen.line}: {_render_spec(current.spec)} against {_render_spec(seen.spec)}. "
+        f"A file written under two compositions holds keys that mean two things, and "
+        f"choosing one of them would leave a join looking sound when it is not."
+    )
+
+
+def _render_spec(spec: tuple[str, ...] | None) -> str:
+    """Render a composition for a message, including its absence."""
+    return "(none recorded)" if spec is None else " / ".join(spec)
+
+
+def _reconcile_spec(
+    recorded: _Recorded, mapping: _FieldMap, path: Path
+) -> tuple[_FieldMap, tuple[str, ...] | None]:
+    """Settle the composition between what the file states and what the caller passed.
+
+    The file wins. A caller who named fields that disagree with it is told, since
+    silently preferring either would hide that the two disagree.
+    """
+    if not recorded.present or recorded.spec is None:
+        return mapping, mapping.scenario_spec
+    named = tuple(mapping.scenario_fields)
+    if named and named != (RECORDED_KEY_FIELD,) and mapping.scenario_spec != recorded.spec:
+        raise LoadError(
+            f"{path}: states that scenario_id was composed from "
+            f"{_render_spec(recorded.spec)}, but scenario_fields="
+            f"{named!r} was passed, which composes {_render_spec(mapping.scenario_spec)}. "
+            f"The file was written by whatever built the keys and the loader is only "
+            f"reconstructing them, so the two must agree; drop scenario_fields to take "
+            f"the recorded composition."
+        )
+    # The key itself is already composed in the file, so it is read verbatim
+    # from its own column while the recorded composition describes it.
+    return replace(mapping, scenario_fields=(RECORDED_KEY_FIELD,), scenario_prefix=()), (
+        recorded.spec
+    )
+
+
+def _merge_provenance(
+    from_preset: LoadProvenance | None, recorded: _Recorded, discarded: int = 0
+) -> LoadProvenance | None:
+    """Gather what is known about the file into one record of provenance.
+
+    A ``benchmark=`` argument says which mapping the caller is applying now; the
+    stamp in the file says which one wrote it. When both are present the file's
+    is the historical fact and is kept.
+
+    A discarded interrupted line is counted here rather than dropped silently.
+    A truncated file should be visibly truncated: a caller comparing the record
+    count against the episodes they expected can see one is missing. It is
+    counted in its own field rather than among the episodes the source excluded,
+    because those are the benchmark's decisions about its run and this is the
+    file failing to keep what the benchmark finished.
+    """
+    if recorded.source is not None:
+        name, _, version = recorded.source.partition("@")
+        return LoadProvenance(
+            preset=name, preset_version=version or None, interrupted_tail=discarded
+        )
+    if from_preset is None:
+        return LoadProvenance(interrupted_tail=discarded) if discarded else None
+    return replace(from_preset, interrupted_tail=discarded)
+
+
 def _explicit(arguments: Mapping[str, Any]) -> dict[str, Any]:
     """Keep only the arguments the caller actually set.
 
@@ -638,11 +790,6 @@ def _read_text(location: _Location) -> str:
         return location.path.read_text()
     except OSError as error:
         raise LoadError(f"{location.path}: cannot be read ({error.strerror})") from error
-
-
-def _read_lines(location: _Location) -> Iterable[tuple[int, str]]:
-    """Yield ``(line_number, line)`` for a text file, one-based."""
-    return enumerate(_read_text(location).splitlines(), start=1)
 
 
 def _parse_json_object(text: str, location: _Location) -> dict[str, Any]:

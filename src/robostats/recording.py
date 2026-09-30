@@ -10,6 +10,18 @@ per line, using the record schema's own field names so there is no mapping to
 invent at load time. See ``docs/recording.md`` for the call sites in LIBERO and
 RoboTwin.
 
+Each line also carries how its ``scenario_id`` was composed and which preset
+produced it. That is repeated per line rather than written once in a header, and
+the reason is the flush: the recorder flushes after every record so that a
+crashed run leaves a usable file, and a header damaged by a truncated write would
+make every line after it unreadable. Repetition turns a partial loss into a
+partial loss instead of a total one, at the cost of some bytes.
+
+Carrying the composition is what lets two files composed differently refuse to
+join. Without it both read back as ``("scenario_id",)`` and
+:class:`~robostats.errors.ScenarioSpecMismatchError` can never fire between two
+files this package wrote.
+
 Two deliberate behaviours
 -------------------------
 **It flushes after every record.** Evaluation runs crash, get killed by a
@@ -26,10 +38,12 @@ for what this means for a long run.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import Any
 
+from robostats.presets import Preset, resolve_preset
 from robostats.records import SCHEMA_VERSION, EpisodeRecord, Protocol
 
 __all__ = ["EpisodeRecorder"]
@@ -58,6 +72,18 @@ class EpisodeRecorder:
         Whether to append to an existing file rather than truncate it. Resuming
         a run appends; starting one truncates, so a half-written file from a
         previous attempt cannot silently merge into this one.
+    scenario_fields : Sequence[str], default ()
+        The fields the caller composed ``scenario_id`` from, recorded on every
+        line so a loader takes the composition rather than reconstructing it. A
+        preset supplies these when one is given.
+    scenario_prefix : Sequence[str], default ()
+        Literal components of the composition, such as a benchmark
+        configuration that is only a directory name. Recorded quoted, so a
+        literal stays distinguishable from a field name.
+    preset : str, Preset or None
+        The preset whose composition these records follow, recorded as
+        ``name@version``. Given by name, it is resolved from the registry, and
+        its ``scenario_fields`` are used unless the caller names their own.
 
     Examples
     --------
@@ -65,7 +91,15 @@ class EpisodeRecorder:
     ...     recorder.record(task_id="put_bowl", scenario_id="clean/17", success=True)
     """
 
-    __slots__ = ("_handle", "_policy_id", "_protocol", "_run_id", "_written")
+    __slots__ = (
+        "_handle",
+        "_policy_id",
+        "_protocol",
+        "_run_id",
+        "_scenario_spec",
+        "_source",
+        "_written",
+    )
 
     def __init__(
         self,
@@ -75,14 +109,30 @@ class EpisodeRecorder:
         run_id: str | None = None,
         protocol: Protocol | None = None,
         append: bool = False,
+        scenario_fields: Sequence[str] = (),
+        scenario_prefix: Sequence[str] = (),
+        preset: str | Preset | None = None,
     ) -> None:
         self._policy_id = policy_id
         self._run_id = run_id
         self._protocol = protocol
+        self._scenario_spec, self._source = _provenance(
+            preset, tuple(scenario_fields), tuple(scenario_prefix)
+        )
         self._written = 0
         self._handle = Path(path).open(  # noqa: SIM115  (held open for the run)
             "a" if append else "w", encoding="utf-8"
         )
+
+    @property
+    def scenario_spec(self) -> tuple[str, ...] | None:
+        """The composition written onto every line, or ``None`` if not recorded."""
+        return self._scenario_spec
+
+    @property
+    def source(self) -> str | None:
+        """The preset stamp written onto every line, or ``None``."""
+        return self._source
 
     @property
     def written(self) -> int:
@@ -154,7 +204,10 @@ class EpisodeRecorder:
             success_detail=detail,
             run_id=self._run_id,
         )
-        self._handle.write(json.dumps(_as_row(record), sort_keys=True) + "\n")
+        row = _as_row(record)
+        row["scenario_spec"] = None if self._scenario_spec is None else list(self._scenario_spec)
+        row["source"] = self._source
+        self._handle.write(json.dumps(row, sort_keys=True) + "\n")
         # Per record, not per run: an evaluation that dies at hour six should
         # leave behind the episodes it did finish.
         self._handle.flush()
@@ -222,3 +275,25 @@ def _protocol_row(protocol: Protocol) -> dict[str, Any]:
     if protocol.extra:
         row["extra"] = dict(sorted(protocol.extra.items()))
     return row
+
+
+def _provenance(
+    preset: str | Preset | None, scenario_fields: tuple[str, ...], scenario_prefix: tuple[str, ...]
+) -> tuple[tuple[str, ...] | None, str | None]:
+    """Work out what to stamp on every line, from a preset and the caller's fields.
+
+    A preset supplies its own composition, so recording under one needs only the
+    literal components the caller pins. Without a preset the caller names the
+    fields, and the stamp is ``None``: nothing published produced this file.
+    """
+    if preset is None:
+        spec: tuple[str, ...] | None = (
+            tuple(repr(value) for value in scenario_prefix) + scenario_fields
+            if scenario_fields
+            else None
+        )
+        return spec, None
+    resolved = preset if isinstance(preset, Preset) else resolve_preset(preset)
+    if scenario_fields:
+        return tuple(repr(value) for value in scenario_prefix) + scenario_fields, resolved.stamp
+    return resolved.scenario_spec_for(scenario_prefix), resolved.stamp
